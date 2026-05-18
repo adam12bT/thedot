@@ -68,6 +68,8 @@ def parse_date(s):
     if pd.isna(s):
         return None
     s = str(s).strip()
+    if s == '':
+        return None
     m = re.search(r'(\w{3} \w{3} \d{2} \d{4} \d{2}:\d{2}:\d{2})', s)
     if m:
         try:
