@@ -8,7 +8,7 @@ import re
 import datetime
 import io
 from pathlib import Path
-
+import inspect
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -21,6 +21,12 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.worksheet.datavalidation import DataValidation
 from openpyxl.worksheet.table import Table, TableStyleInfo
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import cross_val_score, StratifiedKFold
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.metrics import confusion_matrix
+from sklearn.pipeline import Pipeline
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -525,7 +531,6 @@ def c_top_orgs(df):
 
 
 def c_avg_participants(df):
-    """Average participants excluding outliers (> 1000)."""
     clean = df[~df['participant_outlier']].copy()
     avg = clean.groupby('activity_type')['participants'].mean().dropna().sort_values(ascending=False)
     fig, ax = make_fig(9, max(3.5, len(avg) * 0.65 + 1))
@@ -582,7 +587,6 @@ def c_room_hours(df):
 
 
 def c_participants_dist(df):
-    """Distribution chart with outliers excluded (participants > 1000)."""
     all_data = df['participants'].dropna()
     lo, hi   = iqr_bounds(all_data)
     clean    = remove_outliers(all_data)
@@ -692,6 +696,323 @@ def c_yearly_trend(df):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# MACHINE LEARNING — CANCELLATION PREDICTOR
+# ══════════════════════════════════════════════════════════════════════════════
+
+ML_FEATURES = ['hour', 'month', 'weekday_num', 'duration_hours',
+               'room_enc', 'activity_enc', 'participants_clean']
+
+WEEKDAY_MAP = {
+    'Monday': 0, 'Tuesday': 1, 'Wednesday': 2, 'Thursday': 3,
+    'Friday': 4, 'Saturday': 5, 'Sunday': 6,
+}
+
+
+def _prepare_ml_df(df: pd.DataFrame):
+    d = df.copy()
+    d = d[d['status'].isin(['Tenu', 'Annulé'])].copy()
+    d['target'] = (d['status'] == 'Annulé').astype(int)
+    d['weekday_num']        = d['weekday'].map(WEEKDAY_MAP).fillna(0).astype(int)
+    d['participants_clean'] = d['participants'].clip(0, PARTICIPANT_MAX).fillna(0)
+    d['duration_hours']     = d['duration_hours'].fillna(0).clip(0, 72)
+    d['hour']               = d['hour'].fillna(0).astype(int)
+    d['month']              = d['month'].fillna(1).astype(int)
+    room_enc = LabelEncoder()
+    act_enc  = LabelEncoder()
+    d['room_enc']     = room_enc.fit_transform(d['room'].fillna('Unknown'))
+    d['activity_enc'] = act_enc.fit_transform(d['activity_type'].fillna('Unknown'))
+    X = d[ML_FEATURES].values
+    y = d['target'].values
+    return X, y, room_enc, act_enc, d
+
+
+@st.cache_data(show_spinner=False)
+def train_cancellation_model(file_bytes, file_name):
+    df, *_ = load_and_clean(file_bytes, file_name)
+    X, y, room_enc, act_enc, d = _prepare_ml_df(df)
+
+    if len(np.unique(y)) < 2 or len(y) < 50:
+        return None
+
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+
+    candidates = {
+        'Random Forest':       RandomForestClassifier(n_estimators=200, max_depth=8,
+                                                      class_weight='balanced', random_state=42),
+        'Gradient Boosting':   GradientBoostingClassifier(n_estimators=150, max_depth=4,
+                                                          learning_rate=0.08, random_state=42),
+        'Logistic Regression': Pipeline([('scaler', StandardScaler()),
+                                         ('lr', LogisticRegression(class_weight='balanced',
+                                                                    max_iter=500, random_state=42))]),
+    }
+
+    scores = {}
+    for name, model in candidates.items():
+        cv_scores = cross_val_score(model, X, y, cv=cv, scoring='f1', n_jobs=-1)
+        scores[name] = cv_scores
+
+    best_name  = max(scores, key=lambda k: scores[k].mean())
+    best_model = candidates[best_name]
+    best_model.fit(X, y)
+
+    if hasattr(best_model, 'feature_importances_'):
+        importances = best_model.feature_importances_
+    elif hasattr(best_model, 'named_steps'):
+        importances = best_model.named_steps['lr'].coef_[0]
+    else:
+        importances = np.zeros(len(ML_FEATURES))
+
+    y_pred = best_model.predict(X)
+    cm = confusion_matrix(y, y_pred)
+
+    room_risk = (
+        d.groupby('room')['target']
+        .agg(total='count', cancelled='sum')
+        .assign(cancel_rate=lambda x: (x['cancelled'] / x['total'] * 100).round(1))
+        .sort_values('cancel_rate', ascending=False)
+        .reset_index()
+    )
+
+    d['pred_proba'] = best_model.predict_proba(X)[:, 1]
+    high_risk = (
+        d[d['pred_proba'] >= 0.6]
+        .groupby(['room', 'activity_type', 'weekday'])
+        .size()
+        .reset_index(name='count')
+        .sort_values('count', ascending=False)
+        .head(10)
+    )
+
+    return {
+        'model':       best_model,
+        'best_name':   best_name,
+        'scores':      scores,
+        'importances': importances,
+        'cm':          cm,
+        'room_risk':   room_risk,
+        'high_risk':   high_risk,
+        'room_enc':    room_enc,
+        'act_enc':     act_enc,
+        'X':           X,
+        'y':           y,
+        'n_samples':   len(y),
+        'cancel_rate': round(y.mean() * 100, 1),
+    }
+
+
+def predict_single(model_result, hour, month, weekday, duration, room, activity, participants):
+    room_enc = model_result['room_enc']
+    act_enc  = model_result['act_enc']
+
+    def safe_encode(enc, val):
+        classes = list(enc.classes_)
+        return classes.index(val) if val in classes else 0
+
+    row = np.array([[
+        hour,
+        month,
+        WEEKDAY_MAP.get(weekday, 0),
+        min(duration, 72),
+        safe_encode(room_enc, room),
+        safe_encode(act_enc, activity),
+        min(participants, PARTICIPANT_MAX),
+    ]])
+    proba = model_result['model'].predict_proba(row)[0][1]
+    return round(proba * 100, 1)
+
+
+def c_ml_feature_importance(importances, feature_names):
+    fig, ax = make_fig(8, 4)
+    idx = np.argsort(np.abs(importances))
+    colors_bar = [ROSE if v > 0 else INDIGO for v in importances[idx]]
+    ax.barh([feature_names[i] for i in idx], importances[idx],
+            color=colors_bar, edgecolor=WHITE, height=0.55, alpha=0.9)
+    ax.set_title('What influences cancellations the most?')
+    ax.set_xlabel('Influence level (higher = more impact on the prediction)', color=MGRAY, fontsize=10)
+    ax.axvline(0, color=MGRAY, linewidth=0.8, linestyle='--')
+    plt.tight_layout()
+    return fig
+
+
+def c_ml_cv_scores(scores):
+    fig, ax = make_fig(8, 4)
+    names      = list(scores.keys())
+    means      = [scores[n].mean() for n in names]
+    stds       = [scores[n].std()  for n in names]
+    colors_bar = [INDIGO, TEAL, AMBER]
+    bars = ax.bar(names, means, yerr=stds, color=colors_bar[:len(names)],
+                  edgecolor=WHITE, width=0.45, alpha=0.9,
+                  capsize=6, error_kw=dict(color=MGRAY, linewidth=1.5))
+    for b, m in zip(bars, means):
+        ax.text(b.get_x() + b.get_width() / 2, b.get_height() + 0.015,
+                f'{round(m * 100)}%', ha='center', fontsize=10, fontweight='600', color=BLACK)
+    ax.set_ylim(0, 1)
+    ax.set_title('Which prediction method works best on your data?')
+    ax.set_ylabel('Accuracy', color=MGRAY, fontsize=10)
+    ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1))
+    plt.tight_layout()
+    return fig
+
+
+def c_ml_confusion(cm):
+    fig, ax = plt.subplots(figsize=(5, 4), facecolor=WHITE)
+    ax.set_facecolor(WHITE)
+    labels = [['TN', 'FP'], ['FN', 'TP']]
+    cmap   = LinearSegmentedColormap.from_list('cm_cmap', [WHITE, '#C7D2FE', INDIGO])
+    ax.imshow(cm, cmap=cmap, aspect='auto')
+    for i in range(2):
+        for j in range(2):
+            ax.text(j, i, f'{labels[i][j]}\n{cm[i, j]:,}',
+                    ha='center', va='center', fontsize=12,
+                    fontweight='700', color=BLACK if cm[i, j] < cm.max() * 0.6 else WHITE)
+    ax.set_xticks([0, 1]); ax.set_yticks([0, 1])
+    ax.set_xticklabels(['Predicted: Held', 'Predicted: Cancelled'], fontsize=9, color=MGRAY)
+    ax.set_yticklabels(['Actually: Held', 'Actually: Cancelled'], fontsize=9, color=MGRAY)
+    ax.set_title('How often was it right?', pad=12)
+    ax.spines[['top', 'right', 'left', 'bottom']].set_visible(False)
+    plt.tight_layout()
+    return fig
+
+
+def c_ml_room_risk(room_risk):
+    top = room_risk[room_risk['total'] >= 5].head(12)
+    if top.empty:
+        return None
+    fig, ax = make_fig(9, max(3.5, len(top) * 0.6 + 1))
+    max_r      = top['cancel_rate'].max()
+    colors_bar = [ROSE if v == max_r else '#FDA4AF' for v in top['cancel_rate'].values]
+    ax.barh(top['room'], top['cancel_rate'], color=colors_bar,
+            edgecolor=WHITE, height=0.58, alpha=0.92)
+    for p in ax.patches:
+        ax.text(p.get_width() + 0.5, p.get_y() + p.get_height() / 2,
+                f'{p.get_width():.1f}%', va='center', fontsize=9, color=MGRAY, fontweight='500')
+    ax.xaxis.set_major_formatter(mticker.PercentFormatter())
+    ax.set_title('Which rooms have the most cancellations? (historical)')
+    ax.set_xlabel('% of events that were cancelled', color=MGRAY, fontsize=10)
+    ax.invert_yaxis()
+    plt.tight_layout()
+    return fig
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TEXT-TO-PANDAS CHAT
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _df_schema_summary(df: pd.DataFrame) -> str:
+    lines = ["DataFrame name: `df`", f"Shape: {df.shape[0]:,} rows × {df.shape[1]} columns", ""]
+    for col in df.columns:
+        dtype = str(df[col].dtype)
+        nulls = int(df[col].isna().sum())
+        if df[col].dtype == object or str(df[col].dtype) == 'category':
+            uniq   = df[col].dropna().unique()
+            sample = ', '.join(f'"{v}"' for v in uniq[:6])
+            if len(uniq) > 6:
+                sample += f' … ({len(uniq)} unique)'
+            lines.append(f"- `{col}` (str, {nulls} nulls): {sample}")
+        elif 'datetime' in dtype:
+            mn = df[col].min(); mx = df[col].max()
+            lines.append(f"- `{col}` (datetime, {nulls} nulls): {mn} → {mx}")
+        else:
+            mn = df[col].min(); mx = df[col].max()
+            lines.append(f"- `{col}` (numeric, {nulls} nulls): min={mn}, max={mx}")
+    return '\n'.join(lines)
+
+
+_TEXT2PANDAS_SYSTEM = """You are a data analyst assistant. The user asks questions about an event dataset.
+You MUST respond with a JSON object — nothing else, no markdown, no explanation outside the JSON.
+
+JSON format:
+{{
+  "thought": "one sentence explaining your approach",
+  "code": "valid Python using pandas on the variable `df`; result must be stored in `result`",
+  "answer_template": "one sentence with {{result}} as placeholder where the value goes"
+}}
+
+Rules:
+- `df` is already loaded; never read files
+- Store final answer in `result` (scalar, list, or DataFrame)
+- For counts/aggregations return a scalar or small DataFrame
+- For filtering return a DataFrame (max 20 rows with .head(20))
+- Status values are exactly: "Tenu" or "Annulé"
+- Column names are exactly as given in the schema
+- Handle NaN safely (.dropna(), fillna, etc.)
+- Never import anything — pandas (pd) and numpy (np) are already available
+- If the question is unanswerable with this data, set code="result=None" and explain in answer_template
+
+Dataset schema:
+{schema}
+"""
+
+
+def text_to_pandas(question: str, df: pd.DataFrame, history: list) -> dict:
+    import json, traceback
+
+    schema   = _df_schema_summary(df)
+    system   = _TEXT2PANDAS_SYSTEM.format(schema=schema)
+    messages = history + [{"role": "user", "content": question}]
+
+    try:
+        import requests
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"Content-Type": "application/json"},
+            json={
+                "model":    "claude-sonnet-4-20250514",
+                "max_tokens": 1024,
+                "system":   system,
+                "messages": messages,
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        raw = resp.json()["content"][0]["text"].strip()
+    except Exception as e:
+        return {"error": f"API call failed: {e}", "code": "", "thought": "", "answer": ""}
+
+    raw = re.sub(r'^```(?:json)?\s*', '', raw)
+    raw = re.sub(r'\s*```$',          '', raw)
+
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return {"error": f"Could not parse model response:\n{raw}", "code": "", "thought": "", "answer": ""}
+
+    code     = parsed.get("code", "result = None")
+    thought  = parsed.get("thought", "")
+    template = parsed.get("answer_template", "Result: {result}")
+
+    local_ns = {"df": df.copy(), "pd": pd, "np": np, "result": None}
+    try:
+        exec(code, {"__builtins__": {}}, local_ns)
+        result = local_ns.get("result")
+    except Exception as e:
+        return {
+            "error":   f"Code execution error: {e}\n\nGenerated code:\n```python\n{code}\n```",
+            "code":    code,
+            "thought": thought,
+            "answer":  "",
+        }
+
+    if isinstance(result, pd.DataFrame):
+        answer    = template.replace("{result}", f"{len(result):,} rows")
+        result_df = result.head(20)
+    elif result is None:
+        answer    = template.replace("{result}", "no data found")
+        result_df = None
+    else:
+        answer    = template.replace("{result}", str(result))
+        result_df = None
+
+    return {
+        "thought":   thought,
+        "code":      code,
+        "answer":    answer,
+        "result_df": result_df,
+        "error":     None,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # CSS / DESIGN SYSTEM
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -705,7 +1026,6 @@ html, body, [class*="css"] {
     color: #1A1A2E;
 }
 
-/* ── Sidebar ── */
 [data-testid="stSidebar"] {
     background: #1E1B4B !important;
     border-right: 1px solid #312E81 !important;
@@ -728,11 +1048,9 @@ html, body, [class*="css"] {
 [data-testid="stSidebar"] small,
 [data-testid="stSidebar"] .stCaption { color: #6366F1 !important; }
 
-/* ── Main ── */
 .stApp { background: #FAFAFA !important; }
 .block-container { padding-top: 0 !important; padding-bottom: 2rem; max-width: 100% !important; }
 
-/* ── KPI Cards ── */
 .kpi-card {
     background: #FFFFFF;
     border-radius: 12px;
@@ -757,7 +1075,6 @@ html, body, [class*="css"] {
     margin-top: 6px;
 }
 
-/* ── Tabs ── */
 [data-testid="stTabs"] [role="tablist"] {
     border-bottom: 1.5px solid #EBEBEB !important;
     gap: 0;
@@ -777,7 +1094,6 @@ html, body, [class*="css"] {
     border-bottom: 2.5px solid #4F46E5 !important;
 }
 
-/* ── Buttons ── */
 .stDownloadButton > button, .stButton > button {
     background: #4F46E5 !important;
     color: #FFFFFF !important;
@@ -796,7 +1112,6 @@ html, body, [class*="css"] {
     box-shadow: 0 4px 14px rgba(79,70,229,0.3) !important;
 }
 
-/* ── Inputs ── */
 [data-testid="stSelectbox"] > div > div,
 [data-testid="stMultiSelect"] > div > div {
     border-color: #C7D2FE !important;
@@ -805,7 +1120,6 @@ html, body, [class*="css"] {
     color: #1A1A2E !important;
 }
 
-/* ── Multiselect pills ── */
 [data-testid="stMultiSelect"] span[data-baseweb="tag"] {
     background: #EEF2FF !important;
     border: 1px solid #C7D2FE !important;
@@ -819,7 +1133,6 @@ html, body, [class*="css"] {
 [data-testid="stMultiSelect"] span[data-baseweb="tag"] button:hover svg { fill: #3730A3 !important; }
 [data-testid="stMultiSelect"] [data-baseweb="select"] > div { background: #FFFFFF !important; }
 
-/* ── Metric cards ── */
 [data-testid="stMetric"] {
     background: #FFFFFF !important;
     border-radius: 10px !important;
@@ -842,7 +1155,6 @@ html, body, [class*="css"] {
     color: #64748B !important;
 }
 
-/* ── Expanders ── */
 [data-testid="stExpander"] {
     border: 1px solid #E2E8F0 !important;
     border-radius: 10px !important;
@@ -860,7 +1172,6 @@ html, body, [class*="css"] {
     border-radius: 10px !important;
 }
 
-/* ── Section labels ── */
 .section-label {
     font-size: 0.72rem;
     font-weight: 700;
@@ -879,7 +1190,6 @@ html, body, [class*="css"] {
     background: #EBEBEB;
 }
 
-/* ── Chart cards ── */
 .chart-card {
     background: #FFFFFF;
     border-radius: 12px;
@@ -889,14 +1199,12 @@ html, body, [class*="css"] {
     border: 1px solid #F0F0F0;
 }
 
-/* ── Alerts ── */
 .stAlert {
     border-radius: 10px !important;
     border-left: 3px solid #4F46E5 !important;
     background: #F0F0FF !important;
 }
 
-/* ── Misc ── */
 [data-testid="stDataFrame"] { border-radius: 10px !important; overflow: hidden !important; }
 ::-webkit-scrollbar { width: 5px; height: 5px; }
 ::-webkit-scrollbar-track { background: #F8F8F8; }
@@ -906,7 +1214,7 @@ html, body, [class*="css"] {
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MAIN — Streamlit UI only
+# MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
@@ -918,7 +1226,6 @@ def main():
     )
 
     st.markdown(CSS, unsafe_allow_html=True)
-
     chart_style()
 
     # ── SIDEBAR ───────────────────────────────────────────────────────────────
@@ -1074,13 +1381,13 @@ def main():
     with f2:
         sel_type = st.selectbox('Activity Type', ['All'] + sorted(df['activity_type'].dropna().unique().tolist()))
     with f3:
-        years = sorted(df['year'].dropna().unique().tolist())
+        years     = sorted(df['year'].dropna().unique().tolist())
         sel_years = st.multiselect('Year(s)', years, default=years)
 
     dff = df.copy()
-    if sel_status != 'All':  dff = dff[dff['status'] == sel_status]
-    if sel_type   != 'All':  dff = dff[dff['activity_type'] == sel_type]
-    if sel_years:            dff = dff[dff['year'].isin(sel_years)]
+    if sel_status != 'All': dff = dff[dff['status'] == sel_status]
+    if sel_type   != 'All': dff = dff[dff['activity_type'] == sel_type]
+    if sel_years:           dff = dff[dff['year'].isin(sel_years)]
 
     if len(dff) == 0:
         st.warning("No events match the selected filters.")
@@ -1094,8 +1401,8 @@ def main():
     )
 
     # ── TABS ──────────────────────────────────────────────────────────────────
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(
-        ["📊  Charts", "🗂  Data", "🧹  Cleaning", "📋  Statistics", "💾  Export"]
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+        ["📊  Charts", "🗂  Data", "🧹  Cleaning", "📋  Statistics", "💾  Export", "🔮  Cancellation Predictor"]
     )
 
     # ── TAB 1: CHARTS ─────────────────────────────────────────────────────────
@@ -1303,7 +1610,7 @@ def main():
             unsafe_allow_html=True,
         )
         clean_dff_full = dff[~dff['participant_outlier']]
-        part_by_type = clean_dff_full.groupby('activity_type')['participants'].agg(
+        part_by_type   = clean_dff_full.groupby('activity_type')['participants'].agg(
             Total='sum', Average='mean', Max='max', Min='min', Count='count'
         ).round(1)
         part_by_type['Total'] = part_by_type['Total'].apply(lambda x: f"{int(x):,}")
@@ -1369,6 +1676,310 @@ def main():
                     use_container_width=True,
                 )
 
+    # ── TAB 6: ML PREDICTOR ───────────────────────────────────────────────────
+    with tab6:
+        st.markdown('<div style="height:8px"></div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-label">Will my event get cancelled?</div>', unsafe_allow_html=True)
+
+        # Plain-English intro — no jargon
+        st.markdown("""
+        <div style="background:#F0F0FF;border-radius:10px;padding:14px 18px;
+                    border-left:3px solid #4F46E5;margin-bottom:20px;font-size:0.84rem;color:#374151;line-height:1.6;">
+        This tool <strong>learned from your past event history</strong> to estimate whether a new event
+        is likely to be cancelled. It looks for patterns — like which rooms or days tend to have more
+        cancellations — and uses those to give you an early warning.
+        The more events in your data, the more reliable the estimate.
+        </div>
+        """, unsafe_allow_html=True)
+
+        with st.spinner("Analysing your past events…"):
+            uploaded.seek(0)
+            ml = train_cancellation_model(uploaded.read(), uploaded.name)
+
+        if ml is None:
+            st.warning("Not enough data to make predictions yet. You need at least 50 events with a Held or Cancelled status.")
+        else:
+            best_f1   = ml['scores'][ml['best_name']].mean()
+            best_f1_s = ml['scores'][ml['best_name']].std()
+
+            # KPIs in plain English
+            mk1, mk2, mk3, mk4 = st.columns(4)
+            for col, val, label, color in [
+                (mk1, "✅ Ready",                              "Prediction status",           INDIGO),
+                (mk2, f"{round(best_f1 * 100)}% accurate",    "How often it's correct",      EMERALD),
+                (mk3, f"{ml['n_samples']:,} events",          "Past events it learned from", TEAL),
+                (mk4, f"{ml['cancel_rate']}% cancelled",      "Your overall cancellation rate", ROSE),
+            ]:
+                col.markdown(f"""
+                <div style="background:#FFFFFF;border-radius:10px;padding:18px 12px 14px;
+                            border:1px solid #E2E8F0;border-top:3px solid {color};
+                            box-shadow:0 1px 6px rgba(0,0,0,0.04);text-align:center;margin-bottom:16px;">
+                <div style="font-family:'Inter',sans-serif;font-size:1.1rem;font-weight:700;
+                            color:#1A1A2E;line-height:1.2;">{val}</div>
+                <div style="font-size:0.63rem;font-weight:600;text-transform:uppercase;
+                            letter-spacing:0.09em;color:#94A3B8;margin-top:6px;">{label}</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+            # Plain-English note before charts
+            st.markdown("""
+            <div style="font-size:0.82rem;color:#64748B;margin:8px 0 20px;line-height:1.6;">
+            The charts below show <strong>which factors drive cancellations</strong> in your data,
+            and how well the prediction compares to what actually happened.
+            </div>
+            """, unsafe_allow_html=True)
+
+            ca1, ca2 = st.columns(2)
+            with ca1:
+                st.markdown('<div class="chart-card">', unsafe_allow_html=True)
+                st.pyplot(c_ml_cv_scores(ml['scores']), use_container_width=True)
+                st.markdown(
+                    '<div style="font-size:0.75rem;color:#94A3B8;margin-top:8px;">'
+                    'Three different methods were tested — the one with the highest bar was chosen.</div>',
+                    unsafe_allow_html=True,
+                )
+                st.markdown('</div>', unsafe_allow_html=True)
+            with ca2:
+                st.markdown('<div class="chart-card">', unsafe_allow_html=True)
+                st.markdown(
+                    '<div style="font-size:0.78rem;color:#64748B;margin-bottom:8px;">'
+                    'The diagonal boxes show correct predictions. Bigger numbers on the diagonal = better.</div>',
+                    unsafe_allow_html=True,
+                )
+                st.pyplot(c_ml_confusion(ml['cm']), use_container_width=True)
+                st.markdown('</div>', unsafe_allow_html=True)
+
+            # Feature importance
+            feature_labels = [
+                'Time of day', 'Month of year', 'Day of week', 'Event duration',
+                'Room used', 'Type of activity', 'Number of guests',
+            ]
+            st.markdown('<div class="chart-card">', unsafe_allow_html=True)
+            st.pyplot(c_ml_feature_importance(ml['importances'], feature_labels),
+                      use_container_width=True)
+            st.markdown(
+                '<div style="font-size:0.75rem;color:#94A3B8;margin-top:8px;">'
+                'Longer bars = stronger influence on whether an event gets cancelled.</div>',
+                unsafe_allow_html=True,
+            )
+            st.markdown('</div>', unsafe_allow_html=True)
+
+            # Room risk chart
+            rr_fig = c_ml_room_risk(ml['room_risk'])
+            if rr_fig:
+                st.markdown('<div class="chart-card">', unsafe_allow_html=True)
+                st.pyplot(rr_fig, use_container_width=True)
+                st.markdown(
+                    '<div style="font-size:0.75rem;color:#94A3B8;margin-top:8px;">'
+                    'Only rooms with 5+ past events are shown.</div>',
+                    unsafe_allow_html=True,
+                )
+                st.markdown('</div>', unsafe_allow_html=True)
+
+            # High-risk combos
+            if not ml['high_risk'].empty:
+                st.markdown(
+                    '<div class="section-label">⚠️ Combinations most likely to result in cancellation</div>',
+                    unsafe_allow_html=True,
+                )
+                st.markdown(
+                    '<div style="font-size:0.82rem;color:#64748B;margin-bottom:12px;">'
+                    'These room + activity + day combinations have the highest predicted cancellation risk '
+                    'based on your historical data.</div>',
+                    unsafe_allow_html=True,
+                )
+                st.dataframe(ml['high_risk'], use_container_width=True)
+
+            # Live predictor
+            # Live predictor
+            st.markdown('<div class="section-label">Check a specific event</div>', unsafe_allow_html=True)
+
+            st.markdown(
+                '<div style="font-size:0.82rem;color:#64748B;margin-bottom:16px;line-height:1.6;">'
+                "Fill in the details of an event you're planning. "
+                'The tool will estimate — based on patterns from your past events — '
+                'how likely it is to be cancelled. No technical knowledge needed.</div>',
+                unsafe_allow_html=True,
+            )
+
+            known_rooms = sorted([
+                r for r in ml['room_enc'].classes_
+                if r and r != 'Unknown'
+            ])
+
+            known_activities = sorted([
+                a for a in ml['act_enc'].classes_
+                if a and a != 'Unknown'
+            ])
+
+            # Keep prediction result between reruns
+            if "prediction_result" not in st.session_state:
+                st.session_state.prediction_result = None
+
+            # FORM prevents instant UI updates while changing sliders/selects
+            with st.form("prediction_form"):
+
+                p1, p2, p3 = st.columns(3)
+                p4, p5, p6, p7 = st.columns(4)
+
+                with p1:
+                    pred_room = st.selectbox(
+                        'Room',
+                        known_rooms
+                    )
+
+                with p2:
+                    pred_activity = st.selectbox(
+                        'Activity type',
+                        known_activities
+                    )
+
+                with p3:
+                    pred_weekday = st.selectbox(
+                        'Day of week',
+                        [
+                            'Monday',
+                            'Tuesday',
+                            'Wednesday',
+                            'Thursday',
+                            'Friday',
+                            'Saturday',
+                            'Sunday'
+                        ]
+                    )
+
+                with p4:
+                    st.markdown(
+                        '<div style="font-size:0.78rem;color:#64748B;margin-bottom:2px;">'
+                        '🕐 <strong>What time does it start?</strong><br>'
+                        '<span style="font-size:0.72rem;">0 = midnight · 12 = noon · 17 = 5 PM</span></div>',
+                        unsafe_allow_html=True,
+                    )
+
+                    pred_hour = st.slider(
+                        'Start hour',
+                        0,
+                        23,
+                        9,
+                        format='%d:00'
+                    )
+
+                with p5:
+                    st.markdown(
+                        '<div style="font-size:0.78rem;color:#64748B;margin-bottom:2px;">'
+                        '📅 <strong>Which month?</strong><br>'
+                        '<span style="font-size:0.72rem;">1 = January · 12 = December</span></div>',
+                        unsafe_allow_html=True,
+                    )
+
+                    pred_month = st.slider(
+                        'Month',
+                        1,
+                        12,
+                        6
+                    )
+
+                with p6:
+                    st.markdown(
+                        '<div style="font-size:0.78rem;color:#64748B;margin-bottom:2px;">'
+                        '⏱️ <strong>How long is the event?</strong><br>'
+                        '<span style="font-size:0.72rem;">In hours — e.g. 2.0 = two hours</span></div>',
+                        unsafe_allow_html=True,
+                    )
+
+                    pred_duration = st.slider(
+                        'Duration (hours)',
+                        0.5,
+                        24.0,
+                        2.0,
+                        step=0.5,
+                        format='%.1f h'
+                    )
+
+                with p7:
+                    st.markdown(
+                        '<div style="font-size:0.78rem;color:#64748B;margin-bottom:2px;">'
+                        '👥 <strong>How many people expected?</strong><br>'
+                        '<span style="font-size:0.72rem;">Your estimated number of attendees</span></div>',
+                        unsafe_allow_html=True,
+                    )
+
+                    pred_participants = st.slider(
+                        'Expected guests',
+                        0,
+                        1000,
+                        50
+                    )
+
+                submitted = st.form_submit_button(
+                    "🔮 Predict cancellation risk",
+                    use_container_width=True
+                )
+
+            # ONLY runs when button clicked
+            if submitted:
+
+                risk = predict_single(
+                    ml,
+                    pred_hour,
+                    pred_month,
+                    pred_weekday,
+                    pred_duration,
+                    pred_room,
+                    pred_activity,
+                    pred_participants,
+                )
+
+                st.session_state.prediction_result = risk
+
+            # Display result if available
+            if st.session_state.prediction_result is not None:
+
+                risk = st.session_state.prediction_result
+
+                if risk >= 60:
+                    risk_color = ROSE
+                    risk_label = "⚠️ This event is at high risk of being cancelled"
+                    risk_bg = "#FFF1F2"
+                    risk_tip = (
+                        "Consider choosing a different room or day, "
+                        "or following up with the organiser early."
+                    )
+
+                elif risk >= 35:
+                    risk_color = AMBER
+                    risk_label = "🟡 There's a moderate chance this gets cancelled"
+                    risk_bg = "#FFFBEB"
+                    risk_tip = (
+                        "Keep an eye on this one — it may be worth "
+                        "a reminder closer to the date."
+                    )
+
+                else:
+                    risk_color = EMERALD
+                    risk_label = "✅ This event is unlikely to be cancelled"
+                    risk_bg = "#F0FDF4"
+                    risk_tip = "Looking good based on past patterns."
+
+   # Change this line (approx line 990)
+            st.markdown(inspect.cleandoc(f"""
+                <div style="background:{risk_bg};border-radius:14px;padding:28px;text-align:center;
+                            border:2px solid {risk_color};margin-top:12px;">
+                    <div style="font-size:0.85rem;font-weight:700;color:{risk_color};margin-bottom:8px;">
+                        {risk_label}
+                    </div>
+                    <div style="font-size:3.5rem;font-weight:800;color:{risk_color};
+                                letter-spacing:-0.03em;line-height:1;">
+                        {risk}%
+                    </div>
+                    <div style="font-size:0.82rem;color:#64748B;margin-top:10px;">
+                        estimated cancellation probability · based on {ml['n_samples']:,} past events
+                    </div>
+                    <div style="font-size:0.8rem;color:{risk_color};margin-top:8px;font-style:italic;">
+                        {risk_tip}
+                    </div>
+                </div>
+            """), unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
