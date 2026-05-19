@@ -411,3 +411,65 @@ class TestExcelBuilders:
         result = build_removed_excel(empty_rows, duplicate_rows, negative_rows)
         wb = load_workbook(io.BytesIO(result))
         assert set(wb.sheetnames) == {"Empty", "Duplicates", "Negative_Duration"}
+# ─────────────────────────────────────────────────────────────────────────────
+# Gemini API key validation
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestGeminiApiKey:
+    """
+    Verifies that the API key is present, non-empty, and reachable by Gemini.
+    Prints the exact error message if anything goes wrong.
+    """
+
+    def test_api_key_is_set(self):
+        import os
+        from dotenv import load_dotenv
+        load_dotenv()
+        key = os.getenv("GEMINI_API_KEY")
+        assert key, (
+            "PROBLEM: GEMINI_API_KEY is not set.\n"
+            "Fix: create a .env file in the project root with:\n"
+            "  GEMINI_API_KEY=your_actual_key_here"
+        )
+
+    def test_api_key_is_not_placeholder(self):
+        import os
+        from dotenv import load_dotenv
+        load_dotenv()
+        key = os.getenv("GEMINI_API_KEY", "")
+        placeholders = {"your_key_here", "your_actual_key_here", "changeme", "xxx", ""}
+        assert key.lower() not in placeholders, (
+            f"PROBLEM: GEMINI_API_KEY looks like a placeholder: '{key}'\n"
+            "Fix: replace it with your real Gemini API key from "
+            "https://aistudio.google.com/app/apikey"
+        )
+
+    def test_api_key_works_with_gemini(self):
+        """Makes a real (minimal) call to Gemini and prints the exact error if it fails."""
+        import os
+        from dotenv import load_dotenv
+        load_dotenv()
+        key = os.getenv("GEMINI_API_KEY", "")
+        if not key:
+            pytest.skip("GEMINI_API_KEY not set — skipping live test")
+
+        try:
+            import google.generativeai as genai
+            genai.configure(api_key=key)
+            model = genai.GenerativeModel("gemini-2.5-flash")
+            response = model.generate_content("Reply with the single word: OK")
+            text = response.text.strip()
+            assert text, (
+                "PROBLEM: Gemini returned an empty response.\n"
+                "This may mean the model name is wrong or the key has no quota."
+            )
+        except Exception as e:
+            pytest.fail(
+                f"PROBLEM: Gemini API call failed.\n"
+                f"Exact error: {type(e).__name__}: {e}\n\n"
+                "Common causes:\n"
+                "  - Invalid or revoked API key\n"
+                "  - No quota / billing not enabled\n"
+                "  - Network issue or firewall blocking generativeai API\n"
+                "  - Wrong model name ('gemini-2.5-flash' may not be available on your key tier)"
+            )
