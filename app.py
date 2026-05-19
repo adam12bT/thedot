@@ -23,13 +23,22 @@ from sklearn.pipeline import Pipeline
 import json
 import google.generativeai as genai
 from dotenv import load_dotenv
+import os
 
+# Load .env locally
 load_dotenv()
 
-import os
-_GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-genai.configure(api_key=_GEMINI_API_KEY)
+# Read API key
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
+# Validate key
+if not GEMINI_API_KEY:
+    raise ValueError("GEMINI_API_KEY is missing")
+
+# Configure Gemini
+genai.configure(api_key=GEMINI_API_KEY)
+
+# Model
 GEMINI_MODEL = "gemini-2.5-flash"
 
 

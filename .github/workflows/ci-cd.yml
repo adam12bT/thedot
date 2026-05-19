@@ -1,14 +1,3 @@
-# .github/workflows/ci-cd.yml
-#
-# Pipeline:
-#   1. On every push / PR  → run tests
-#   2. On push to main     → if tests pass, deploy to Hugging Face Spaces (FREE)
-#
-# Required GitHub Secrets (Settings → Secrets → Actions):
-#   HF_TOKEN       — from huggingface.co → Settings → Access Tokens (write access)
-#   HF_USERNAME    — your Hugging Face username
-#   HF_SPACE_NAME  — your Space name (e.g. event-analytics)
-
 name: CI / CD
 
 on:
@@ -24,11 +13,15 @@ concurrency:
 jobs:
 
   # ────────────────────────────────────────────────────────────────────────────
-  # JOB 1 — Tests (runs on every push and every PR)
+  # JOB 1 — Tests
   # ────────────────────────────────────────────────────────────────────────────
   test:
     name: Run tests
     runs-on: ubuntu-latest
+
+    # API Keys / Secrets
+    env:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
 
     steps:
       - name: Checkout code
@@ -61,13 +54,20 @@ jobs:
           path: coverage.xml
 
   # ────────────────────────────────────────────────────────────────────────────
-  # JOB 2 — Deploy (only on push to main, only if tests passed)
+  # JOB 2 — Deploy to Hugging Face Spaces
   # ────────────────────────────────────────────────────────────────────────────
   deploy:
     name: Deploy to Hugging Face Spaces
     runs-on: ubuntu-latest
     needs: test
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    # Secrets / Environment Variables
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      HF_USERNAME: ${{ secrets.HF_USERNAME }}
+      HF_SPACE_NAME: ${{ secrets.HF_SPACE_NAME }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
 
     steps:
       - name: Checkout code
@@ -76,17 +76,17 @@ jobs:
           fetch-depth: 0
           lfs: true
 
-      - name: Push to Hugging Face Space
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          HF_USERNAME: ${{ secrets.HF_USERNAME }}
-          HF_SPACE_NAME: ${{ secrets.HF_SPACE_NAME }}
+      - name: Configure Git
         run: |
           git config --global user.email "ci@github.com"
           git config --global user.name "GitHub Actions"
+
+      - name: Push to Hugging Face Space
+        run: |
           git remote add hf https://user:${HF_TOKEN}@huggingface.co/spaces/${HF_USERNAME}/${HF_SPACE_NAME}
           git push hf main --force
 
       - name: Notify success
         run: |
-          echo "Deployed to https://huggingface.co/spaces/${{ secrets.HF_USERNAME }}/${{ secrets.HF_SPACE_NAME }}"
+          echo "Successfully deployed!"
+          echo "https://huggingface.co/spaces/${HF_USERNAME}/${HF_SPACE_NAME}"
