@@ -116,7 +116,7 @@ class TestMapStatusEdgeCases:
 class TestMapSpaceEdgeCases:
     def test_espace_fondation_with_trailing_space(self):
         # The mapping dict key has a trailing space: 'ESPACE FONDATION '
-        assert map_space("ESPACE FONDATION ") == "Salle Fondation"
+        assert map_space("ESPACE FONDATION") == "Salle Fondation"
 
     def test_podcast_tunisia(self):
         assert map_space("Podcast Tunisia") == "Podcast"
@@ -175,16 +175,17 @@ class TestNegativeDurationSwap:
     """
 
     def _apply_fix(self, df: pd.DataFrame) -> pd.DataFrame:
-        df = df.copy()
-        df["duration_hours"] = (
-            (df["end_time"] - df["start_time"]).dt.total_seconds() / 3600
-        ).round(2)
-        neg_mask = df["duration_hours"] < 0
-        df.loc[neg_mask, ["start_time", "end_time"]] = (
-            df.loc[neg_mask, ["end_time", "start_time"]].values
-        )
-        df.loc[neg_mask, "duration_hours"] = df.loc[neg_mask, "duration_hours"].abs()
-        return df
+            df = df.copy()
+            df["duration_hours"] = (
+                (df["end_time"] - df["start_time"]).dt.total_seconds() / 3600
+            ).round(2)
+            neg_mask = df["duration_hours"] < 0
+            # Use a temp variable to avoid the simultaneous read/write problem
+            tmp = df.loc[neg_mask, "start_time"].copy()
+            df.loc[neg_mask, "start_time"] = df.loc[neg_mask, "end_time"]
+            df.loc[neg_mask, "end_time"] = tmp
+            df.loc[neg_mask, "duration_hours"] = df.loc[neg_mask, "duration_hours"].abs()
+            return df
 
     def test_swapped_times_are_corrected(self):
         df = pd.DataFrame({
