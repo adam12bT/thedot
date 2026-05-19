@@ -300,7 +300,7 @@ def map_space(s):
         return ''
     return {
         'Salle Polyvalente': 'Salle de formation',
-        'ESPACE FONDATION ': 'Salle Fondation',
+        'ESPACE FONDATION': 'Salle Fondation',
         'Training Room': 'Salle de formation',
         'Terrasse': 'Terrasse',
         'BALE': 'BALE',
