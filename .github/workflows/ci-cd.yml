@@ -21,7 +21,7 @@ jobs:
 
     # API Keys / Secrets
     env:
-      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      GEMINI_API_KEY: ${{ vars.GEMINI_API_KEY }}  # vars. not secrets.
 
     steps:
       - name: Checkout code
