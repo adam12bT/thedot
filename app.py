@@ -1383,8 +1383,7 @@ def main():
                     padding:28px 24px 24px;margin:-1rem -1rem 20px;border-bottom:1px solid #312E81;">
         <div style="font-family:'Inter',sans-serif;font-size:1.35rem;font-weight:700;
                     color:#FFFFFF;letter-spacing:-0.02em;line-height:1.2;">Event Analytics</div>
-        <div style="font-size:0.7rem;font-weight:500;color:rgba(255,255,255,0.6);
-                    letter-spacing:0.08em;text-transform:uppercase;margin-top:5px;">Pipeline · v4.2</div>
+
         </div>
         """, unsafe_allow_html=True)
 
