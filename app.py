@@ -1,14 +1,7 @@
-"""
-Event Analytics Pipeline — Streamlit App (v4.0)
-Clean minimal design · threshold-based outlier exclusion (participants > 1000)
-Run: streamlit run app.py
-"""
-
 import re
 import datetime
 import io
 from pathlib import Path
-import inspect
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -27,6 +20,206 @@ from sklearn.model_selection import cross_val_score, StratifiedKFold
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.metrics import confusion_matrix
 from sklearn.pipeline import Pipeline
+import json
+import google.generativeai as genai
+from dotenv import load_dotenv
+
+load_dotenv()
+
+import os
+_GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+genai.configure(api_key=_GEMINI_API_KEY)
+
+GEMINI_MODEL = "gemini-2.5-flash"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CHAT / AI QUERY
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _auto_answer(question: str, result_df) -> str | None:
+    """Generate a factual answer from result_df when possible, overriding LLM hallucination."""
+    if result_df is None or result_df.empty:
+        return None
+    if result_df.shape == (1, 1):
+        val = result_df.iloc[0, 0]
+        col = result_df.columns[0]
+        if col == "result":
+            if isinstance(val, (int, np.integer)):
+                return f"The answer is **{int(val):,}**."
+            elif isinstance(val, (float, np.floating)):
+                return f"The answer is **{float(val):,.2f}**."
+            else:
+                return f"The answer is **{val}**."
+    return None
+
+
+def _fix_answer_number(answer: str, result_df) -> str:
+    """If result_df is a single scalar and the answer states a wrong number, correct it."""
+    if result_df is None or result_df.empty:
+        return answer
+    try:
+        if result_df.shape == (1, 1):
+            actual_value = result_df.iloc[0, 0]
+            if not isinstance(actual_value, (int, float, np.integer, np.floating)):
+                return answer
+            actual = int(actual_value) if isinstance(actual_value, (int, np.integer)) else float(actual_value)
+            nums_in_answer = re.findall(r'\b\d+(?:\.\d+)?\b', answer)
+            if nums_in_answer:
+                stated_str = nums_in_answer[0]
+                stated = float(stated_str)
+                if stated != actual:
+                    actual_str = str(int(actual)) if isinstance(actual, float) and actual == int(actual) else str(actual)
+                    answer = re.sub(r'\b' + re.escape(stated_str) + r'\b', actual_str, answer, count=1)
+    except Exception:
+        pass
+    return answer
+
+
+def text_to_pandas(question: str, df, history: list) -> dict:
+
+    if not _GEMINI_API_KEY:
+        return {
+            "answer": "", "thought": "", "code": "",
+            "result_df": None,
+            "error": "No Gemini API key set. Add GEMINI_API_KEY to your environment variables.",
+        }
+
+    system_prompt = f"""You are a Python/pandas expert assistant.
+The user has a DataFrame called `df` with the following structure:
+- Columns : {list(df.columns)}
+- Dtypes  : {df.dtypes.to_dict()}
+- Sample  : {df.head(3).to_dict()}
+
+Rules:
+1. Write pandas code that answers the question using the variable `df`.
+2. Store the final result in a variable called `result_df` (always a DataFrame or None).
+3. If the result is a single number or value, wrap it: result_df = pd.DataFrame([{{"result": <value>}}])
+4. Return ONLY a valid JSON object — no markdown fences, no extra text — with these exact keys:
+   - "thought" : your brief reasoning (1-2 sentences)
+   - "code"    : the executable Python/pandas code. IMPORTANT: use only single quotes for Python strings inside the code field to avoid JSON parse errors. Never use double quotes inside Python string literals in the code.
+   - "answer"  : plain-English answer. CRITICAL: if your code computes a scalar result stored in result_df, you MUST read that computed value and use it in your answer. Never guess or assume the number — always derive the answer from what your code actually computes.
+
+CRITICAL JSON RULES:
+- The entire response must be valid JSON.
+- Never use unescaped double quotes inside string values.
+- Never include raw newline characters inside string values — use \\n if needed.
+- Use single quotes for all Python string literals in the code field.
+
+Example output format:
+{{"thought":"I will filter for cancelled events in the last year and count them.","code":"last_year = df['year'].max() - 1\\nfiltered = df[(df['year'] == last_year) & (df['status'] == 'Annulé')]\\nresult_df = pd.DataFrame([{{'result': len(filtered)}}])","answer":"There were 42 events cancelled last year."}}"""
+
+    gemini_history = []
+    for msg in history:
+        role = "model" if msg["role"] == "assistant" else "user"
+        gemini_history.append({"role": role, "parts": [msg["content"]]})
+
+    raw = ""
+    try:
+        model = genai.GenerativeModel(
+            model_name=GEMINI_MODEL,
+            system_instruction=system_prompt,
+            generation_config=genai.GenerationConfig(temperature=0.1),
+        )
+        chat = model.start_chat(history=gemini_history)
+        response = chat.send_message(question)
+        raw = response.text.strip()
+
+        # Step 1: strip markdown fences
+        clean = re.sub(r"```(?:json|python)?|```", "", raw).strip()
+
+        # Step 2: extract the JSON object
+        match = re.search(r"\{.*\}", clean, re.DOTALL)
+        if not match:
+            return {
+                "answer": "", "thought": "", "code": raw,
+                "result_df": None, "error": "Model did not return valid JSON.",
+            }
+
+        json_str = match.group()
+
+        # Step 3: try direct parse
+        parsed = None
+        try:
+            parsed = json.loads(json_str)
+        except json.JSONDecodeError:
+            # Step 4: fix unescaped newlines and tabs inside string values
+            json_str_fixed = re.sub(r'(?<!\\)\n', r'\\n', json_str)
+            json_str_fixed = re.sub(r'(?<!\\)\t', r'\\t', json_str_fixed)
+            try:
+                parsed = json.loads(json_str_fixed)
+            except json.JSONDecodeError:
+                # Step 5: last resort — regex field extraction
+                thought_m = re.search(r'"thought"\s*:\s*"((?:[^"\\]|\\.)*)"', json_str)
+                answer_m  = re.search(r'"answer"\s*:\s*"((?:[^"\\]|\\.)*)"',  json_str)
+                # For code, try to grab everything between "code": " and the next top-level key
+                code_m    = re.search(r'"code"\s*:\s*"(.*?)"(?=\s*,\s*"(?:answer|thought)")', json_str, re.DOTALL)
+                if not code_m:
+                    code_m = re.search(r'"code"\s*:\s*"((?:[^"\\]|\\.)*)"', json_str)
+
+                parsed = {
+                    "thought": thought_m.group(1) if thought_m else "",
+                    "code":    code_m.group(1).replace("\\n", "\n") if code_m else "",
+                    "answer":  answer_m.group(1) if answer_m else "",
+                }
+
+        if parsed is None:
+            return {
+                "answer": "", "thought": "", "code": raw,
+                "result_df": None, "error": "JSON parse error: could not recover from malformed response.",
+            }
+
+        code = parsed.get("code", "").strip()
+        # Unescape sequences Gemini may have double-escaped
+        code = code.replace("\\n", "\n").replace("\\'", "'")
+
+        result_df = None
+        if code:
+            local_vars = {"df": df.copy(), "pd": pd, "np": np}
+            exec(code, {}, local_vars)  # nosec
+            result_df = local_vars.get("result_df", None)
+
+            if isinstance(result_df, pd.Series):
+                result_df = result_df.to_frame()
+            elif isinstance(result_df, (int, float, str, bool, np.integer, np.floating)):
+                result_df = pd.DataFrame([{"result": result_df}])
+            elif isinstance(result_df, (list, tuple, dict, np.ndarray)):
+                try:
+                    result_df = pd.DataFrame(result_df)
+                except Exception:
+                    result_df = pd.DataFrame([{"result": str(result_df)}])
+            elif result_df is not None and not isinstance(result_df, pd.DataFrame):
+                try:
+                    result_df = pd.DataFrame([{"result": str(result_df)}])
+                except Exception:
+                    result_df = None
+
+        # ── Fix answer: prefer auto-generated truth over LLM's stated answer ──
+        answer_text = parsed.get("answer", "")
+        auto = _auto_answer(question, result_df)
+        if auto:
+            answer_text = auto
+        else:
+            answer_text = _fix_answer_number(answer_text, result_df)
+
+        return {
+            "answer":    answer_text,
+            "thought":   parsed.get("thought", ""),
+            "code":      code,
+            "result_df": result_df,
+            "error":     None,
+        }
+
+    except json.JSONDecodeError as e:
+        return {
+            "answer": "", "thought": "", "code": raw,
+            "result_df": None, "error": f"JSON parse error: {e}",
+        }
+    except Exception as e:
+        return {
+            "answer": "", "thought": "", "code": raw,
+            "result_df": None, "error": str(e),
+        }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -50,19 +243,10 @@ CHART_COLORS = [
     "#065F46", "#92400E",
 ]
 
-# ══════════════════════════════════════════════════════════════════════════════
-# OUTLIER CONSTANTS & UTILITIES
-# ══════════════════════════════════════════════════════════════════════════════
 PARTICIPANT_MAX = 1000
 
 
-def iqr_bounds(series):
-    """Fixed threshold: valid range is [0, PARTICIPANT_MAX]."""
-    return 0, PARTICIPANT_MAX
-
-
 def remove_outliers(series):
-    """Return series keeping only participants in [0, 1000]."""
     return series[(series >= 0) & (series <= PARTICIPANT_MAX)]
 
 
@@ -80,17 +264,17 @@ def parse_date(s):
     if m:
         try:
             return pd.to_datetime(m.group(1), format='%a %b %d %Y %H:%M:%S')
-        except:
+        except Exception:
             pass
     m = re.search(r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})', s)
     if m:
         try:
             return pd.to_datetime(m.group(1))
-        except:
+        except Exception:
             pass
     try:
         return pd.to_datetime(s)
-    except:
+    except Exception:
         return None
 
 
@@ -265,13 +449,9 @@ def load_and_clean(file_bytes, file_name):
     df['hour']       = df['start_time'].dt.hour
     df['room']       = df['room'].str.replace(r'^0,\s*', '', regex=True).str.strip()
 
-    lo, hi = iqr_bounds(df['participants'])
-    if lo is not None:
-        df['participant_outlier'] = ~df['participants'].isna() & (
-            (df['participants'] < lo) | (df['participants'] > hi)
-        )
-    else:
-        df['participant_outlier'] = False
+    df['participant_outlier'] = ~df['participants'].isna() & (
+        (df['participants'] < 0) | (df['participants'] > PARTICIPANT_MAX)
+    )
 
     return df, empty_rows, duplicate_rows, negative_rows
 
@@ -588,7 +768,6 @@ def c_room_hours(df):
 
 def c_participants_dist(df):
     all_data = df['participants'].dropna()
-    lo, hi   = iqr_bounds(all_data)
     clean    = remove_outliers(all_data)
     n_out    = len(all_data) - len(clean)
 
@@ -615,14 +794,14 @@ def c_participants_dist(df):
 
     axes[1].hist(clean, bins=28, color=INDIGO, edgecolor=WHITE, alpha=0.82)
     title_suffix = f"  ·  {n_out} outlier{'s' if n_out != 1 else ''} removed" if n_out > 0 else ""
-    axes[1].set_title(f'Histogram (participants ≤ 1,000){title_suffix}', fontsize=11)
+    axes[1].set_title(f'Histogram (participants ≤ {PARTICIPANT_MAX:,}){title_suffix}', fontsize=11)
     axes[1].set_xlabel('Participants', color=MGRAY, fontsize=10)
     axes[1].set_ylabel('Events', color=MGRAY, fontsize=10)
 
     if n_out > 0:
         axes[1].axvline(
             PARTICIPANT_MAX, color=ROSE, linewidth=1.2, linestyle="--", alpha=0.7,
-            label="Outlier threshold: 1,000",
+            label=f"Outlier threshold: {PARTICIPANT_MAX:,}",
         )
         axes[1].legend(fontsize=8, framealpha=0.9, edgecolor="#EBEBEB")
 
@@ -895,124 +1074,6 @@ def c_ml_room_risk(room_risk):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TEXT-TO-PANDAS CHAT
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _df_schema_summary(df: pd.DataFrame) -> str:
-    lines = ["DataFrame name: `df`", f"Shape: {df.shape[0]:,} rows × {df.shape[1]} columns", ""]
-    for col in df.columns:
-        dtype = str(df[col].dtype)
-        nulls = int(df[col].isna().sum())
-        if df[col].dtype == object or str(df[col].dtype) == 'category':
-            uniq   = df[col].dropna().unique()
-            sample = ', '.join(f'"{v}"' for v in uniq[:6])
-            if len(uniq) > 6:
-                sample += f' … ({len(uniq)} unique)'
-            lines.append(f"- `{col}` (str, {nulls} nulls): {sample}")
-        elif 'datetime' in dtype:
-            mn = df[col].min(); mx = df[col].max()
-            lines.append(f"- `{col}` (datetime, {nulls} nulls): {mn} → {mx}")
-        else:
-            mn = df[col].min(); mx = df[col].max()
-            lines.append(f"- `{col}` (numeric, {nulls} nulls): min={mn}, max={mx}")
-    return '\n'.join(lines)
-
-
-_TEXT2PANDAS_SYSTEM = """You are a data analyst assistant. The user asks questions about an event dataset.
-You MUST respond with a JSON object — nothing else, no markdown, no explanation outside the JSON.
-
-JSON format:
-{{
-  "thought": "one sentence explaining your approach",
-  "code": "valid Python using pandas on the variable `df`; result must be stored in `result`",
-  "answer_template": "one sentence with {{result}} as placeholder where the value goes"
-}}
-
-Rules:
-- `df` is already loaded; never read files
-- Store final answer in `result` (scalar, list, or DataFrame)
-- For counts/aggregations return a scalar or small DataFrame
-- For filtering return a DataFrame (max 20 rows with .head(20))
-- Status values are exactly: "Tenu" or "Annulé"
-- Column names are exactly as given in the schema
-- Handle NaN safely (.dropna(), fillna, etc.)
-- Never import anything — pandas (pd) and numpy (np) are already available
-- If the question is unanswerable with this data, set code="result=None" and explain in answer_template
-
-Dataset schema:
-{schema}
-"""
-
-
-def text_to_pandas(question: str, df: pd.DataFrame, history: list) -> dict:
-    import json, traceback
-
-    schema   = _df_schema_summary(df)
-    system   = _TEXT2PANDAS_SYSTEM.format(schema=schema)
-    messages = history + [{"role": "user", "content": question}]
-
-    try:
-        import requests
-        resp = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={"Content-Type": "application/json"},
-            json={
-                "model":    "claude-sonnet-4-20250514",
-                "max_tokens": 1024,
-                "system":   system,
-                "messages": messages,
-            },
-            timeout=30,
-        )
-        resp.raise_for_status()
-        raw = resp.json()["content"][0]["text"].strip()
-    except Exception as e:
-        return {"error": f"API call failed: {e}", "code": "", "thought": "", "answer": ""}
-
-    raw = re.sub(r'^```(?:json)?\s*', '', raw)
-    raw = re.sub(r'\s*```$',          '', raw)
-
-    try:
-        parsed = json.loads(raw)
-    except Exception:
-        return {"error": f"Could not parse model response:\n{raw}", "code": "", "thought": "", "answer": ""}
-
-    code     = parsed.get("code", "result = None")
-    thought  = parsed.get("thought", "")
-    template = parsed.get("answer_template", "Result: {result}")
-
-    local_ns = {"df": df.copy(), "pd": pd, "np": np, "result": None}
-    try:
-        exec(code, {"__builtins__": {}}, local_ns)
-        result = local_ns.get("result")
-    except Exception as e:
-        return {
-            "error":   f"Code execution error: {e}\n\nGenerated code:\n```python\n{code}\n```",
-            "code":    code,
-            "thought": thought,
-            "answer":  "",
-        }
-
-    if isinstance(result, pd.DataFrame):
-        answer    = template.replace("{result}", f"{len(result):,} rows")
-        result_df = result.head(20)
-    elif result is None:
-        answer    = template.replace("{result}", "no data found")
-        result_df = None
-    else:
-        answer    = template.replace("{result}", str(result))
-        result_df = None
-
-    return {
-        "thought":   thought,
-        "code":      code,
-        "answer":    answer,
-        "result_df": result_df,
-        "error":     None,
-    }
-
-
-# ══════════════════════════════════════════════════════════════════════════════
 # CSS / DESIGN SYSTEM
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1209,6 +1270,84 @@ html, body, [class*="css"] {
 ::-webkit-scrollbar { width: 5px; height: 5px; }
 ::-webkit-scrollbar-track { background: #F8F8F8; }
 ::-webkit-scrollbar-thumb { background: #E2E8F0; border-radius: 4px; }
+
+.chat-bubble-user {
+    background: #4F46E5;
+    color: #FFFFFF;
+    border-radius: 14px 14px 4px 14px;
+    padding: 12px 16px;
+    margin: 6px 0 6px auto;
+    max-width: 72%;
+    font-size: 0.88rem;
+    line-height: 1.5;
+    width: fit-content;
+}
+.chat-bubble-assistant {
+    background: #FFFFFF;
+    color: #1A1A2E;
+    border-radius: 14px 14px 14px 4px;
+    padding: 12px 16px;
+    margin: 6px auto 6px 0;
+    max-width: 80%;
+    font-size: 0.88rem;
+    line-height: 1.5;
+    border: 1px solid #E2E8F0;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.04);
+    width: fit-content;
+}
+.chat-bubble-assistant .thought {
+    font-size: 0.74rem;
+    color: #94A3B8;
+    font-style: italic;
+    margin-bottom: 6px;
+    border-bottom: 1px solid #F0F0F0;
+    padding-bottom: 6px;
+}
+.chat-error {
+    background: #FFF1F2;
+    border: 1px solid #FECDD3;
+    border-radius: 10px;
+    padding: 12px 16px;
+    color: #E11D48;
+    font-size: 0.82rem;
+    margin: 6px 0;
+}
+.chat-code {
+    background: #F8F9FF;
+    border: 1px solid #E0E7FF;
+    border-radius: 8px;
+    padding: 10px 14px;
+    font-size: 0.76rem;
+    font-family: 'Courier New', monospace;
+    color: #3730A3;
+    margin-top: 6px;
+    overflow-x: auto;
+    white-space: pre-wrap;
+}
+.chat-input-area {
+    position: sticky;
+    bottom: 0;
+    background: #FAFAFA;
+    padding: 12px 0 4px;
+    border-top: 1px solid #EBEBEB;
+    margin-top: 16px;
+}
+.chat-suggestions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 14px;
+}
+.chat-suggestion-pill {
+    background: #EEF2FF;
+    border: 1px solid #C7D2FE;
+    border-radius: 20px;
+    padding: 5px 12px;
+    font-size: 0.76rem;
+    font-weight: 600;
+    color: #3730A3;
+    cursor: pointer;
+}
 </style>
 """
 
@@ -1236,7 +1375,7 @@ def main():
         <div style="font-family:'Inter',sans-serif;font-size:1.35rem;font-weight:700;
                     color:#FFFFFF;letter-spacing:-0.02em;line-height:1.2;">Event Analytics</div>
         <div style="font-size:0.7rem;font-weight:500;color:rgba(255,255,255,0.6);
-                    letter-spacing:0.08em;text-transform:uppercase;margin-top:5px;">Pipeline · v4.0</div>
+                    letter-spacing:0.08em;text-transform:uppercase;margin-top:5px;">Pipeline · v4.2</div>
         </div>
         """, unsafe_allow_html=True)
 
@@ -1260,7 +1399,7 @@ def main():
         """, unsafe_allow_html=True)
 
         st.markdown("<hr style='border-color:#EBEBEB;margin:20px 0'>", unsafe_allow_html=True)
-        st.caption("Powered by Streamlit · matplotlib · openpyxl")
+        st.caption("Powered by Streamlit · matplotlib · openpyxl · Gemini")
 
     # ── HEADER BANNER ─────────────────────────────────────────────────────────
     st.markdown("""
@@ -1284,7 +1423,7 @@ def main():
     <div style="margin-left:auto;">
         <span style="background:#EEF2FF;color:#4F46E5;font-size:0.68rem;font-weight:600;
                     letter-spacing:0.06em;padding:4px 10px;border-radius:6px;
-                    border:1px solid #C7D2FE;">v4.0</span>
+                    border:1px solid #C7D2FE;">v4.2</span>
     </div>
     </div>
     """, unsafe_allow_html=True)
@@ -1369,7 +1508,7 @@ def main():
         st.markdown(
             f'<div style="font-size:0.73rem;color:#94A3B8;margin-top:8px;">'
             f'* Participant metrics exclude <strong style="color:#E11D48">{n_outliers}</strong> '
-            f'event{"s" if n_outliers != 1 else ""} with participants > 1,000 (treated as outliers)</div>',
+            f'event{"s" if n_outliers != 1 else ""} with participants > {PARTICIPANT_MAX:,} (treated as outliers)</div>',
             unsafe_allow_html=True,
         )
 
@@ -1401,9 +1540,15 @@ def main():
     )
 
     # ── TABS ──────────────────────────────────────────────────────────────────
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
-        ["📊  Charts", "🗂  Data", "🧹  Cleaning", "📋  Statistics", "💾  Export", "🔮  Cancellation Predictor"]
-    )
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+        "📊  Charts",
+        "🗂  Data",
+        "🧹  Cleaning",
+        "📋  Statistics",
+        "💾  Export",
+        "🔮  Cancellation Predictor",
+        "💬  Ask your data",
+    ])
 
     # ── TAB 1: CHARTS ─────────────────────────────────────────────────────────
     with tab1:
@@ -1532,7 +1677,7 @@ def main():
         outlier_rows = df[df['participant_outlier']]
         if not outlier_rows.empty:
             with st.expander(
-                f"Participant outliers (> 1,000, kept but excluded from stats)  ·  {len(outlier_rows):,}"
+                f"Participant outliers (> {PARTICIPANT_MAX:,}, kept but excluded from stats)  ·  {len(outlier_rows):,}"
             ):
                 st.dataframe(
                     outlier_rows[['event_name', 'start_time', 'room', 'participants', 'organization']],
@@ -1581,7 +1726,7 @@ def main():
             """, unsafe_allow_html=True)
 
         if n_outliers > 0:
-            st.caption(f"* {n_outliers} event(s) with participants > 1,000 are excluded from participant stats")
+            st.caption(f"* {n_outliers} event(s) with participants > {PARTICIPANT_MAX:,} are excluded from participant stats")
 
         st.markdown('<div class="section-label">Descriptive Statistics</div>', unsafe_allow_html=True)
         col1, col2 = st.columns(2)
@@ -1681,7 +1826,6 @@ def main():
         st.markdown('<div style="height:8px"></div>', unsafe_allow_html=True)
         st.markdown('<div class="section-label">Will my event get cancelled?</div>', unsafe_allow_html=True)
 
-        # Plain-English intro — no jargon
         st.markdown("""
         <div style="background:#F0F0FF;border-radius:10px;padding:14px 18px;
                     border-left:3px solid #4F46E5;margin-bottom:20px;font-size:0.84rem;color:#374151;line-height:1.6;">
@@ -1700,9 +1844,7 @@ def main():
             st.warning("Not enough data to make predictions yet. You need at least 50 events with a Held or Cancelled status.")
         else:
             best_f1   = ml['scores'][ml['best_name']].mean()
-            best_f1_s = ml['scores'][ml['best_name']].std()
 
-            # KPIs in plain English
             mk1, mk2, mk3, mk4 = st.columns(4)
             for col, val, label, color in [
                 (mk1, "✅ Ready",                              "Prediction status",           INDIGO),
@@ -1721,7 +1863,6 @@ def main():
                 </div>
                 """, unsafe_allow_html=True)
 
-            # Plain-English note before charts
             st.markdown("""
             <div style="font-size:0.82rem;color:#64748B;margin:8px 0 20px;line-height:1.6;">
             The charts below show <strong>which factors drive cancellations</strong> in your data,
@@ -1749,7 +1890,6 @@ def main():
                 st.pyplot(c_ml_confusion(ml['cm']), use_container_width=True)
                 st.markdown('</div>', unsafe_allow_html=True)
 
-            # Feature importance
             feature_labels = [
                 'Time of day', 'Month of year', 'Day of week', 'Event duration',
                 'Room used', 'Type of activity', 'Number of guests',
@@ -1764,7 +1904,6 @@ def main():
             )
             st.markdown('</div>', unsafe_allow_html=True)
 
-            # Room risk chart
             rr_fig = c_ml_room_risk(ml['room_risk'])
             if rr_fig:
                 st.markdown('<div class="chart-card">', unsafe_allow_html=True)
@@ -1776,7 +1915,6 @@ def main():
                 )
                 st.markdown('</div>', unsafe_allow_html=True)
 
-            # High-risk combos
             if not ml['high_risk'].empty:
                 st.markdown(
                     '<div class="section-label">⚠️ Combinations most likely to result in cancellation</div>',
@@ -1790,8 +1928,6 @@ def main():
                 )
                 st.dataframe(ml['high_risk'], use_container_width=True)
 
-            # Live predictor
-            # Live predictor
             st.markdown('<div class="section-label">Check a specific event</div>', unsafe_allow_html=True)
 
             st.markdown(
@@ -1802,52 +1938,23 @@ def main():
                 unsafe_allow_html=True,
             )
 
-            known_rooms = sorted([
-                r for r in ml['room_enc'].classes_
-                if r and r != 'Unknown'
-            ])
+            known_rooms = sorted([r for r in ml['room_enc'].classes_ if r and r != 'Unknown'])
+            known_activities = sorted([a for a in ml['act_enc'].classes_ if a and a != 'Unknown'])
 
-            known_activities = sorted([
-                a for a in ml['act_enc'].classes_
-                if a and a != 'Unknown'
-            ])
-
-            # Keep prediction result between reruns
             if "prediction_result" not in st.session_state:
                 st.session_state.prediction_result = None
 
-            # FORM prevents instant UI updates while changing sliders/selects
             with st.form("prediction_form"):
-
                 p1, p2, p3 = st.columns(3)
                 p4, p5, p6, p7 = st.columns(4)
 
                 with p1:
-                    pred_room = st.selectbox(
-                        'Room',
-                        known_rooms
-                    )
-
+                    pred_room = st.selectbox('Room', known_rooms)
                 with p2:
-                    pred_activity = st.selectbox(
-                        'Activity type',
-                        known_activities
-                    )
-
+                    pred_activity = st.selectbox('Activity type', known_activities)
                 with p3:
-                    pred_weekday = st.selectbox(
-                        'Day of week',
-                        [
-                            'Monday',
-                            'Tuesday',
-                            'Wednesday',
-                            'Thursday',
-                            'Friday',
-                            'Saturday',
-                            'Sunday'
-                        ]
-                    )
-
+                    pred_weekday = st.selectbox('Day of week',
+                        ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'])
                 with p4:
                     st.markdown(
                         '<div style="font-size:0.78rem;color:#64748B;margin-bottom:2px;">'
@@ -1855,15 +1962,7 @@ def main():
                         '<span style="font-size:0.72rem;">0 = midnight · 12 = noon · 17 = 5 PM</span></div>',
                         unsafe_allow_html=True,
                     )
-
-                    pred_hour = st.slider(
-                        'Start hour',
-                        0,
-                        23,
-                        9,
-                        format='%d:00'
-                    )
-
+                    pred_hour = st.slider('Start hour', 0, 23, 9, format='%d:00')
                 with p5:
                     st.markdown(
                         '<div style="font-size:0.78rem;color:#64748B;margin-bottom:2px;">'
@@ -1871,14 +1970,7 @@ def main():
                         '<span style="font-size:0.72rem;">1 = January · 12 = December</span></div>',
                         unsafe_allow_html=True,
                     )
-
-                    pred_month = st.slider(
-                        'Month',
-                        1,
-                        12,
-                        6
-                    )
-
+                    pred_month = st.slider('Month', 1, 12, 6)
                 with p6:
                     st.markdown(
                         '<div style="font-size:0.78rem;color:#64748B;margin-bottom:2px;">'
@@ -1886,100 +1978,208 @@ def main():
                         '<span style="font-size:0.72rem;">In hours — e.g. 2.0 = two hours</span></div>',
                         unsafe_allow_html=True,
                     )
-
-                    pred_duration = st.slider(
-                        'Duration (hours)',
-                        0.5,
-                        24.0,
-                        2.0,
-                        step=0.5,
-                        format='%.1f h'
-                    )
-
+                    pred_duration = st.slider('Duration (hours)', 0.5, 24.0, 2.0, step=0.5, format='%.1f h')
                 with p7:
                     st.markdown(
                         '<div style="font-size:0.78rem;color:#64748B;margin-bottom:2px;">'
                         '👥 <strong>How many people expected?</strong><br>'
-                        '<span style="font-size:0.72rem;">Your estimated number of attendees</span></div>',
+                        f'<span style="font-size:0.72rem;">Your estimated number of attendees</span></div>',
                         unsafe_allow_html=True,
                     )
+                    pred_participants = st.slider('Expected guests', 0, PARTICIPANT_MAX, 50)
 
-                    pred_participants = st.slider(
-                        'Expected guests',
-                        0,
-                        1000,
-                        50
-                    )
+                submitted = st.form_submit_button("🔮 Predict cancellation risk", use_container_width=True)
 
-                submitted = st.form_submit_button(
-                    "🔮 Predict cancellation risk",
-                    use_container_width=True
-                )
-
-            # ONLY runs when button clicked
             if submitted:
-
-                risk = predict_single(
-                    ml,
-                    pred_hour,
-                    pred_month,
-                    pred_weekday,
-                    pred_duration,
-                    pred_room,
-                    pred_activity,
-                    pred_participants,
-                )
-
+                risk = predict_single(ml, pred_hour, pred_month, pred_weekday,
+                                      pred_duration, pred_room, pred_activity, pred_participants)
                 st.session_state.prediction_result = risk
 
-            # Display result if available
             if st.session_state.prediction_result is not None:
-
                 risk = st.session_state.prediction_result
 
                 if risk >= 60:
-                    risk_color = ROSE
-                    risk_label = "⚠️ This event is at high risk of being cancelled"
+                    risk_color = ROSE; risk_label = "⚠️ This event is at high risk of being cancelled"
                     risk_bg = "#FFF1F2"
-                    risk_tip = (
-                        "Consider choosing a different room or day, "
-                        "or following up with the organiser early."
-                    )
-
+                    risk_tip = "Consider choosing a different room or day, or following up with the organiser early."
                 elif risk >= 35:
-                    risk_color = AMBER
-                    risk_label = "🟡 There's a moderate chance this gets cancelled"
+                    risk_color = AMBER; risk_label = "🟡 There's a moderate chance this gets cancelled"
                     risk_bg = "#FFFBEB"
-                    risk_tip = (
-                        "Keep an eye on this one — it may be worth "
-                        "a reminder closer to the date."
-                    )
-
+                    risk_tip = "Keep an eye on this one — it may be worth a reminder closer to the date."
                 else:
-                    risk_color = EMERALD
-                    risk_label = "✅ This event is unlikely to be cancelled"
+                    risk_color = EMERALD; risk_label = "✅ This event is unlikely to be cancelled"
                     risk_bg = "#F0FDF4"
                     risk_tip = "Looking good based on past patterns."
 
-   # Change this line (approx line 990)
-            st.markdown(inspect.cleandoc(f"""
-                <div style="background:{risk_bg};border-radius:14px;padding:28px;text-align:center;
-                            border:2px solid {risk_color};margin-top:12px;">
-                    <div style="font-size:0.85rem;font-weight:700;color:{risk_color};margin-bottom:8px;">
-                        {risk_label}
-                    </div>
-                    <div style="font-size:3.5rem;font-weight:800;color:{risk_color};
-                                letter-spacing:-0.03em;line-height:1;">
-                        {risk}%
-                    </div>
-                    <div style="font-size:0.82rem;color:#64748B;margin-top:10px;">
-                        estimated cancellation probability · based on {ml['n_samples']:,} past events
-                    </div>
-                    <div style="font-size:0.8rem;color:{risk_color};margin-top:8px;font-style:italic;">
-                        {risk_tip}
-                    </div>
-                </div>
-            """), unsafe_allow_html=True)
+                st.markdown(
+                    f"""<div style="background:{risk_bg};border-radius:14px;padding:28px;text-align:center;
+                                border:2px solid {risk_color};margin-top:12px;">
+                        <div style="font-size:0.85rem;font-weight:700;color:{risk_color};margin-bottom:8px;">
+                            {risk_label}
+                        </div>
+                        <div style="font-size:3.5rem;font-weight:800;color:{risk_color};
+                                    letter-spacing:-0.03em;line-height:1;">
+                            {risk}%
+                        </div>
+                        <div style="font-size:0.82rem;color:#64748B;margin-top:10px;">
+                            estimated cancellation probability · based on {ml['n_samples']:,} past events
+                        </div>
+                        <div style="font-size:0.8rem;color:{risk_color};margin-top:8px;font-style:italic;">
+                            {risk_tip}
+                        </div>
+                    </div>""",
+                    unsafe_allow_html=True,
+                )
+
+    # ── TAB 7: ASK YOUR DATA (Chat) ───────────────────────────────────────────
+    with tab7:
+        st.markdown('<div style="height:8px"></div>', unsafe_allow_html=True)
+
+       
+
+        EXAMPLE_QUESTIONS = [
+            "How many events were cancelled last year?",
+            "Which room had the most events?",
+            "What's the average number of participants per event?",
+            "Which organisation booked the most events?",
+            "Show me events with more than 200 participants",
+            "What day of the week has the highest cancellation rate?",
+            "How many unique organisations used the space?",
+            "What's the longest event we've ever held?",
+        ]
+
+        if "chat_history_display" not in st.session_state:
+            st.session_state.chat_history_display = []
+        if "chat_history_ollama" not in st.session_state:
+            st.session_state.chat_history_ollama = []
+        if "chat_prefill" not in st.session_state:
+            st.session_state.chat_prefill = ""
+
+        st.markdown(
+            '<div style="font-size:0.72rem;font-weight:700;text-transform:uppercase;'
+            'letter-spacing:0.1em;color:#4F46E5;margin-bottom:8px;">Try asking…</div>',
+            unsafe_allow_html=True,
+        )
+        pill_cols = st.columns(4)
+        for i, q in enumerate(EXAMPLE_QUESTIONS):
+            if pill_cols[i % 4].button(q, key=f"pill_{i}", use_container_width=True):
+                st.session_state.chat_prefill = q
+                st.rerun()
+
+        st.markdown("<hr style='border-color:#EBEBEB;margin:16px 0'>", unsafe_allow_html=True)
+
+        for msg in st.session_state.chat_history_display:
+            if msg["role"] == "user":
+                st.markdown(
+                    f'<div class="chat-bubble-user">{msg["content"]}</div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                meta = msg.get("meta", {})
+                if meta.get("error"):
+                    st.markdown(
+                        f'<div class="chat-error">⚠️ {meta["error"]}</div>',
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    thought_html = (
+                        f'<div class="thought">💭 {meta["thought"]}</div>'
+                        if meta.get("thought") else ""
+                    )
+                    st.markdown(
+                        f'<div class="chat-bubble-assistant">'
+                        f'{thought_html}'
+                        f'<div>{msg["content"]}</div>'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+                    if isinstance(meta.get("result_df"), pd.DataFrame):
+                        st.dataframe(meta["result_df"], use_container_width=True)
+                    if meta.get("code"):
+                        with st.expander("🔍 See generated code", expanded=False):
+                            st.code(meta["code"], language="python")
+
+        st.markdown('<div class="chat-input-area">', unsafe_allow_html=True)
+
+        left_col, right_col = st.columns([5, 1])
+        with left_col:
+            user_input = st.text_input(
+                "Ask a question about your data",
+                value=st.session_state.chat_prefill,
+                placeholder="e.g. Which room has the highest cancellation rate?",
+                key="chat_input",
+                label_visibility="collapsed",
+            )
+        with right_col:
+            send_clicked = st.button("Ask →", key="chat_send", use_container_width=True)
+
+        if st.session_state.chat_prefill and user_input == st.session_state.chat_prefill:
+            st.session_state.chat_prefill = ""
+
+        if st.session_state.chat_history_display:
+            if st.button("🗑️ Clear conversation", key="chat_clear"):
+                st.session_state.chat_history_display = []
+                st.session_state.chat_history_ollama = []
+                st.rerun()
+
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        if (send_clicked or user_input) and user_input.strip():
+            question = user_input.strip()
+
+            last_user = next(
+                (m for m in reversed(st.session_state.chat_history_display)
+                if m["role"] == "user"), None,
+            )
+            if last_user and last_user["content"] == question:
+                st.stop()
+
+            st.session_state.chat_history_display.append(
+                {"role": "user", "content": question}
+            )
+
+            with st.spinner("Thinking…"):
+                result = text_to_pandas(
+                    question=question,
+                    df=dff,
+                    history=st.session_state.chat_history_ollama,
+                )
+
+            if result.get("error"):
+                st.session_state.chat_history_display.append({
+                    "role": "assistant",
+                    "content": "",
+                    "meta": {
+                        "error":     result["error"],
+                        "thought":   result.get("thought", ""),
+                        "code":      result.get("code", ""),
+                        "result_df": None,
+                    },
+                })
+            else:
+                st.session_state.chat_history_display.append({
+                    "role": "assistant",
+                    "content": result["answer"],
+                    "meta": {
+                        "thought":   result.get("thought", ""),
+                        "code":      result.get("code", ""),
+                        "result_df": result.get("result_df"),
+                        "error":     None,
+                    },
+                })
+                st.session_state.chat_history_ollama.append(
+                    {"role": "user", "content": question}
+                )
+                st.session_state.chat_history_ollama.append(
+                    {"role": "assistant", "content": result["answer"]}
+                )
+                if len(st.session_state.chat_history_ollama) > 20:
+                    st.session_state.chat_history_ollama = (
+                        st.session_state.chat_history_ollama[-20:]
+                    )
+
+            st.rerun()
+
 
 if __name__ == "__main__":
     main()
