@@ -26,17 +26,18 @@ from dotenv import load_dotenv
 import os
 
 # Load .env locally
-load_dotenv()
 
-# Read API key
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+def _get_gemini_key() -> str:
+    # 1. Streamlit Cloud secrets (production)
+    try:
+        return st.secrets["GEMINI_API_KEY"]
+    except (KeyError, FileNotFoundError):
+        pass
+    # 2. Environment variable (GitHub Actions / local .env)
+    return os.environ.get("GEMINI_API_KEY", "")
 
-# Validate key
-if not GEMINI_API_KEY:
-    raise ValueError("GEMINI_API_KEY is missing")
-
-# Configure Gemini
-genai.configure(api_key=GEMINI_API_KEY)
+_GEMINI_API_KEY = _get_gemini_key()
+genai.configure(api_key=_GEMINI_API_KEY)
 
 # Model
 GEMINI_MODEL = "gemini-2.5-flash"
