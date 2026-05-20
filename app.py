@@ -25,22 +25,22 @@ import google.generativeai as genai
 from dotenv import load_dotenv
 import os
 
-# Load .env locally
 
 def _get_gemini_key() -> str:
-    # 1. Streamlit Cloud secrets (production)
     try:
         return st.secrets["GEMINI_API_KEY"]
     except (KeyError, FileNotFoundError):
         pass
-    # 2. Environment variable (GitHub Actions / local .env)
     return os.environ.get("GEMINI_API_KEY", "")
+
+
+
 
 _GEMINI_API_KEY = _get_gemini_key()
 genai.configure(api_key=_GEMINI_API_KEY)
 
-# Model
 GEMINI_MODEL = "gemini-2.5-flash"
+PARTICIPANT_MAX = 1000
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -48,7 +48,6 @@ GEMINI_MODEL = "gemini-2.5-flash"
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _auto_answer(question: str, result_df) -> str | None:
-    """Generate a factual answer from result_df when possible, overriding LLM hallucination."""
     if result_df is None or result_df.empty:
         return None
     if result_df.shape == (1, 1):
@@ -65,7 +64,6 @@ def _auto_answer(question: str, result_df) -> str | None:
 
 
 def _fix_answer_number(answer: str, result_df) -> str:
-    """If result_df is a single scalar and the answer states a wrong number, correct it."""
     if result_df is None or result_df.empty:
         return answer
     try:
@@ -135,10 +133,7 @@ Example output format:
         response = chat.send_message(question)
         raw = response.text.strip()
 
-        # Step 1: strip markdown fences
         clean = re.sub(r"```(?:json|python)?|```", "", raw).strip()
-
-        # Step 2: extract the JSON object
         match = re.search(r"\{.*\}", clean, re.DOTALL)
         if not match:
             return {
@@ -147,26 +142,20 @@ Example output format:
             }
 
         json_str = match.group()
-
-        # Step 3: try direct parse
         parsed = None
         try:
             parsed = json.loads(json_str)
         except json.JSONDecodeError:
-            # Step 4: fix unescaped newlines and tabs inside string values
             json_str_fixed = re.sub(r'(?<!\\)\n', r'\\n', json_str)
             json_str_fixed = re.sub(r'(?<!\\)\t', r'\\t', json_str_fixed)
             try:
                 parsed = json.loads(json_str_fixed)
             except json.JSONDecodeError:
-                # Step 5: last resort — regex field extraction
                 thought_m = re.search(r'"thought"\s*:\s*"((?:[^"\\]|\\.)*)"', json_str)
                 answer_m  = re.search(r'"answer"\s*:\s*"((?:[^"\\]|\\.)*)"',  json_str)
-                # For code, try to grab everything between "code": " and the next top-level key
                 code_m    = re.search(r'"code"\s*:\s*"(.*?)"(?=\s*,\s*"(?:answer|thought)")', json_str, re.DOTALL)
                 if not code_m:
                     code_m = re.search(r'"code"\s*:\s*"((?:[^"\\]|\\.)*)"', json_str)
-
                 parsed = {
                     "thought": thought_m.group(1) if thought_m else "",
                     "code":    code_m.group(1).replace("\\n", "\n") if code_m else "",
@@ -180,7 +169,6 @@ Example output format:
             }
 
         code = parsed.get("code", "").strip()
-        # Unescape sequences Gemini may have double-escaped
         code = code.replace("\\n", "\n").replace("\\'", "'")
 
         result_df = None
@@ -204,7 +192,6 @@ Example output format:
                 except Exception:
                     result_df = None
 
-        # ── Fix answer: prefer auto-generated truth over LLM's stated answer ──
         answer_text = parsed.get("answer", "")
         auto = _auto_answer(question, result_df)
         if auto:
@@ -252,12 +239,6 @@ CHART_COLORS = [
     "#059669", "#7C3AED", "#0284C7", "#DB2777",
     "#065F46", "#92400E",
 ]
-
-PARTICIPANT_MAX = 1000
-
-
-def remove_outliers(series):
-    return series[(series >= 0) & (series <= PARTICIPANT_MAX)]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -459,11 +440,14 @@ def load_and_clean(file_bytes, file_name):
     df['hour']       = df['start_time'].dt.hour
     df['room']       = df['room'].str.replace(r'^0,\s*', '', regex=True).str.strip()
 
-    df['participant_outlier'] = ~df['participants'].isna() & (
+    # ── REMOVE participant outliers from the dataset entirely ──────────────
+    outlier_mask = ~df['participants'].isna() & (
         (df['participants'] < 0) | (df['participants'] > PARTICIPANT_MAX)
     )
+    outlier_rows = df[outlier_mask].copy()
+    df = df[~outlier_mask].reset_index(drop=True)
 
-    return df, empty_rows, duplicate_rows, negative_rows
+    return df, empty_rows, duplicate_rows, negative_rows, outlier_rows
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -545,18 +529,17 @@ def build_excel(df):
     total = len(df)
     held  = int((df['status'] == 'Tenu').sum())
     canc  = int((df['status'] == 'Annulé').sum())
-    clean_p = remove_outliers(df['participants'])
 
     for ri, (lbl, val) in enumerate([
-        ('Total Events',                    total),
-        ('Held Events',                     held),
-        ('Cancelled Events',                canc),
-        ('Cancellation Rate (%)',           round(canc / total * 100, 1) if total else 0),
-        ('Total Hours Booked',              round(df['duration_hours'].sum(), 1)),
-        ('Total Participants (excl. outliers)', int(clean_p.sum(skipna=True))),
-        ('Avg Participants (excl. outliers)',   round(clean_p.mean(skipna=True), 1)),
-        ('Unique Organizations',            int(df['organization'].nunique())),
-        ('Unique Rooms',                    int(df['room'].nunique())),
+        ('Total Events',              total),
+        ('Held Events',               held),
+        ('Cancelled Events',          canc),
+        ('Cancellation Rate (%)',     round(canc / total * 100, 1) if total else 0),
+        ('Total Hours Booked',        round(df['duration_hours'].sum(), 1)),
+        ('Total Participants',        int(df['participants'].sum(skipna=True))),
+        ('Avg Participants',          round(df['participants'].mean(skipna=True), 1)),
+        ('Unique Organizations',      int(df['organization'].nunique())),
+        ('Unique Rooms',              int(df['room'].nunique())),
     ], 2):
         ws2.cell(row=ri, column=1, value=lbl).font = Font(bold=True, name='Calibri', size=10)
         ws2.cell(row=ri, column=2, value=val).font = Font(name='Calibri', size=10)
@@ -566,12 +549,13 @@ def build_excel(df):
     return buf.getvalue()
 
 
-def build_removed_excel(empty_rows, duplicate_rows, negative_rows):
+def build_removed_excel(empty_rows, duplicate_rows, negative_rows, outlier_rows):
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine='openpyxl') as w:
         empty_rows.to_excel(w, sheet_name='Empty', index=False)
         duplicate_rows.to_excel(w, sheet_name='Duplicates', index=False)
         negative_rows.to_excel(w, sheet_name='Negative_Duration', index=False)
+        outlier_rows.to_excel(w, sheet_name='Participant_Outliers', index=False)
     return buf.getvalue()
 
 
@@ -721,15 +705,14 @@ def c_top_orgs(df):
 
 
 def c_avg_participants(df):
-    clean = df[~df['participant_outlier']].copy()
-    avg = clean.groupby('activity_type')['participants'].mean().dropna().sort_values(ascending=False)
+    avg = df.groupby('activity_type')['participants'].mean().dropna().sort_values(ascending=False)
     fig, ax = make_fig(9, max(3.5, len(avg) * 0.65 + 1))
     colors = CHART_COLORS[:len(avg)]
     ax.barh(avg.index, avg.values, color=colors, edgecolor=WHITE, height=0.52, alpha=0.92)
     for p in ax.patches:
         ax.text(p.get_width() + 0.5, p.get_y() + p.get_height() / 2,
                 f'{p.get_width():.1f}', va='center', fontsize=9, color=MGRAY, fontweight='500')
-    ax.set_title('Avg Participants by Activity Type (outliers excluded)')
+    ax.set_title('Avg Participants by Activity Type')
     ax.set_xlabel('Avg Participants', color=MGRAY, fontsize=10)
     ax.invert_yaxis()
     plt.tight_layout()
@@ -777,10 +760,7 @@ def c_room_hours(df):
 
 
 def c_participants_dist(df):
-    all_data = df['participants'].dropna()
-    clean    = remove_outliers(all_data)
-    n_out    = len(all_data) - len(clean)
-
+    clean = df['participants'].dropna()
     fig, axes = plt.subplots(1, 2, figsize=(13, 4.5), facecolor=WHITE)
     for ax in axes:
         ax.set_facecolor(WHITE)
@@ -798,22 +778,14 @@ def c_participants_dist(df):
         capprops=dict(color=TEAL, linewidth=2),
         flierprops=dict(marker='o', color=ROSE, alpha=0.5, markersize=4),
     )
-    axes[0].set_title('Participant Distribution\n(outliers removed)', fontsize=11)
+    axes[0].set_title('Participant Distribution', fontsize=11)
     axes[0].set_ylabel('Participants', color=MGRAY, fontsize=10)
     axes[0].set_xticks([])
 
     axes[1].hist(clean, bins=28, color=INDIGO, edgecolor=WHITE, alpha=0.82)
-    title_suffix = f"  ·  {n_out} outlier{'s' if n_out != 1 else ''} removed" if n_out > 0 else ""
-    axes[1].set_title(f'Histogram (participants ≤ {PARTICIPANT_MAX:,}){title_suffix}', fontsize=11)
+    axes[1].set_title('Histogram of Participants', fontsize=11)
     axes[1].set_xlabel('Participants', color=MGRAY, fontsize=10)
     axes[1].set_ylabel('Events', color=MGRAY, fontsize=10)
-
-    if n_out > 0:
-        axes[1].axvline(
-            PARTICIPANT_MAX, color=ROSE, linewidth=1.2, linestyle="--", alpha=0.7,
-            label=f"Outlier threshold: {PARTICIPANT_MAX:,}",
-        )
-        axes[1].legend(fontsize=8, framealpha=0.9, edgecolor="#EBEBEB")
 
     plt.tight_layout()
     return fig
@@ -902,7 +874,7 @@ def _prepare_ml_df(df: pd.DataFrame):
     d = d[d['status'].isin(['Tenu', 'Annulé'])].copy()
     d['target'] = (d['status'] == 'Annulé').astype(int)
     d['weekday_num']        = d['weekday'].map(WEEKDAY_MAP).fillna(0).astype(int)
-    d['participants_clean'] = d['participants'].clip(0, PARTICIPANT_MAX).fillna(0)
+    d['participants_clean'] = d['participants'].fillna(0).clip(0, PARTICIPANT_MAX)
     d['duration_hours']     = d['duration_hours'].fillna(0).clip(0, 72)
     d['hour']               = d['hour'].fillna(0).astype(int)
     d['month']              = d['month'].fillna(1).astype(int)
@@ -1384,7 +1356,6 @@ def main():
                     padding:28px 24px 24px;margin:-1rem -1rem 20px;border-bottom:1px solid #312E81;">
         <div style="font-family:'Inter',sans-serif;font-size:1.35rem;font-weight:700;
                     color:#FFFFFF;letter-spacing:-0.02em;line-height:1.2;">Event Analytics</div>
-
         </div>
         """, unsafe_allow_html=True)
 
@@ -1432,7 +1403,7 @@ def main():
     <div style="margin-left:auto;">
         <span style="background:#EEF2FF;color:#4F46E5;font-size:0.68rem;font-weight:600;
                     letter-spacing:0.06em;padding:4px 10px;border-radius:6px;
-                    border:1px solid #C7D2FE;">v4.2</span>
+                    border:1px solid #C7D2FE;">v4.3</span>
     </div>
     </div>
     """, unsafe_allow_html=True)
@@ -1453,10 +1424,10 @@ def main():
 
         col1, col2, col3, col4 = st.columns(4)
         for col, icon, label, desc, color in [
-            (col1, "🧹", "Clean",   "Removes empty rows, dupes & fixes bad timestamps", EMERALD),
-            (col2, "📊", "Analyse", "12+ charts auto-generated from your data",         INDIGO),
-            (col3, "🔍", "Filter",  "Slice by status, type & year live",                AMBER),
-            (col4, "💾", "Export",  "Styled Excel + removed rows report + CSV",         VIOLET),
+            (col1, "🧹", "Clean",   "Removes empty rows, dupes, bad timestamps & participant outliers", EMERALD),
+            (col2, "📊", "Analyse", "12+ charts auto-generated from your data",                         INDIGO),
+            (col3, "🔍", "Filter",  "Slice by status, type & year live",                                AMBER),
+            (col4, "💾", "Export",  "Styled Excel + removed rows report + CSV",                         VIOLET),
         ]:
             col.markdown(f"""
             <div style="background:#FFFFFF;border-radius:12px;padding:24px;text-align:center;
@@ -1472,20 +1443,17 @@ def main():
 
     # ── LOAD DATA ─────────────────────────────────────────────────────────────
     with st.spinner("Processing data…"):
-        df, empty_rows, duplicate_rows, negative_rows = load_and_clean(
+        df, empty_rows, duplicate_rows, negative_rows, outlier_rows = load_and_clean(
             uploaded.read(), uploaded.name
         )
-
-    clean_participants = remove_outliers(df['participants'])
-    n_outliers         = int(df['participant_outlier'].sum())
 
     total_events = len(df)
     held         = int((df['status'] == 'Tenu').sum())
     cancelled    = int((df['status'] == 'Annulé').sum())
     cancel_rate  = round(cancelled / total_events * 100, 1) if total_events else 0
     total_hours  = round(df['duration_hours'].sum(), 1)
-    total_part   = int(clean_participants.sum(skipna=True))
-    avg_part     = round(clean_participants.mean(skipna=True), 1)
+    total_part   = int(df['participants'].sum(skipna=True))
+    avg_part     = round(df['participants'].mean(skipna=True), 1)
     unique_orgs  = int(df['organization'].nunique())
     unique_rooms = int(df['room'].replace('', pd.NA).dropna().nunique())
 
@@ -1498,8 +1466,8 @@ def main():
         ("Cancelled",     f"{cancelled:,}",       "#E11D48"),
         ("Cancel Rate",   f"{cancel_rate}%",      "#7C3AED"),
         ("Total Hours",   f"{total_hours:,.1f}h", "#0284C7"),
-        ("Participants*", f"{total_part:,}",      "#0D9488"),
-        ("Avg / Event*",  f"{avg_part:,.1f}",     "#D97706"),
+        ("Participants",  f"{total_part:,}",      "#0D9488"),
+        ("Avg / Event",   f"{avg_part:,.1f}",     "#D97706"),
         ("Organisations", f"{unique_orgs:,}",     "#DB2777"),
         ("Rooms",         f"{unique_rooms:,}",    "#1A1A2E"),
     ]
@@ -1512,14 +1480,6 @@ def main():
         <div class="kpi-label">{label}</div>
         </div>
         """, unsafe_allow_html=True)
-
-    if n_outliers > 0:
-        st.markdown(
-            f'<div style="font-size:0.73rem;color:#94A3B8;margin-top:8px;">'
-            f'* Participant metrics exclude <strong style="color:#E11D48">{n_outliers}</strong> '
-            f'event{"s" if n_outliers != 1 else ""} with participants > {PARTICIPANT_MAX:,} (treated as outliers)</div>',
-            unsafe_allow_html=True,
-        )
 
     # ── FILTERS ───────────────────────────────────────────────────────────────
     st.markdown('<div class="section-label">Filters</div>', unsafe_allow_html=True)
@@ -1634,30 +1594,27 @@ def main():
         show_cols = [c for c in [
             'event_name', 'activity_type', 'start_time', 'end_time',
             'room', 'status', 'organization', 'participants',
-            'duration_hours', 'participant_outlier',
+            'duration_hours',
         ] if c in dff.columns]
         st.dataframe(dff[show_cols], use_container_width=True, height=520)
-        st.caption(
-            f"{len(dff):,} rows · {len(show_cols)} columns shown · "
-            "participant_outlier = True means excluded from participant stats"
-        )
+        st.caption(f"{len(dff):,} rows · {len(show_cols)} columns shown")
 
     # ── TAB 3: CLEANING ───────────────────────────────────────────────────────
     with tab3:
         st.markdown('<div style="height:8px"></div>', unsafe_allow_html=True)
 
-        n_orig    = total_events + len(empty_rows) + len(duplicate_rows)
-        n_empty   = len(empty_rows)
-        n_dupes   = len(duplicate_rows)
-        n_neg     = len(negative_rows)
-        n_out_all = int(df['participant_outlier'].sum())
+        n_orig  = total_events + len(empty_rows) + len(duplicate_rows)
+        n_empty = len(empty_rows)
+        n_dupes = len(duplicate_rows)
+        n_neg   = len(negative_rows)
+        n_out   = len(outlier_rows)
 
         cleaning_stats = [
-            ("Original Rows",        f"{n_orig:,}",    "#4F46E5"),
-            ("Empty Removed",        f"{n_empty:,}",   "#E11D48"),
-            ("Duplicates Removed",   f"{n_dupes:,}",   "#D97706"),
-            ("Neg Duration Fixed",   f"{n_neg:,}",     "#0D9488"),
-            ("Participant Outliers", f"{n_out_all:,}", "#7C3AED"),
+            ("Original Rows",        f"{n_orig:,}",  "#4F46E5"),
+            ("Empty Removed",        f"{n_empty:,}", "#E11D48"),
+            ("Duplicates Removed",   f"{n_dupes:,}", "#D97706"),
+            ("Neg Duration Fixed",   f"{n_neg:,}",   "#0D9488"),
+            ("Participant Outliers Removed", f"{n_out:,}", "#7C3AED"),
         ]
         c1, c2, c3, c4, c5 = st.columns(5)
         for col, (label, value, color) in zip([c1, c2, c3, c4, c5], cleaning_stats):
@@ -1683,10 +1640,9 @@ def main():
         if not negative_rows.empty:
             with st.expander(f"Negative-duration fixed  ·  {len(negative_rows):,}"):
                 st.dataframe(negative_rows, use_container_width=True)
-        outlier_rows = df[df['participant_outlier']]
         if not outlier_rows.empty:
             with st.expander(
-                f"Participant outliers (> {PARTICIPANT_MAX:,}, kept but excluded from stats)  ·  {len(outlier_rows):,}"
+                f"Participant outliers removed (> {PARTICIPANT_MAX:,})  ·  {len(outlier_rows):,}"
             ):
                 st.dataframe(
                     outlier_rows[['event_name', 'start_time', 'room', 'participants', 'organization']],
@@ -1704,11 +1660,10 @@ def main():
     with tab4:
         st.markdown('<div style="height:8px"></div>', unsafe_allow_html=True)
 
-        clean_dff    = remove_outliers(dff['participants'])
-        total_part_f = clean_dff.sum(skipna=True)
+        total_part_f = dff['participants'].sum(skipna=True)
         total_dur_f  = dff['duration_hours'].sum()
         avg_dur_f    = dff['duration_hours'].mean()
-        avg_part_f   = clean_dff.mean(skipna=True)
+        avg_part_f   = dff['participants'].mean(skipna=True)
 
         st.markdown(
             '<div class="section-label">Aggregate Totals — Filtered View</div>',
@@ -1716,10 +1671,10 @@ def main():
         )
         s1, s2, s3, s4 = st.columns(4)
         for col, val, label, color, suffix in [
-            (s1, f"{int(total_part_f):,}", "Total Participants*",       TEAL,   ""),
-            (s2, f"{total_dur_f:,.1f}",    "Total Hours Booked",        SKY,    "h"),
-            (s3, f"{avg_part_f:.1f}",      "Avg Participants / Event*", AMBER,  ""),
-            (s4, f"{avg_dur_f:.2f}",       "Avg Duration / Event",      VIOLET, "h"),
+            (s1, f"{int(total_part_f):,}", "Total Participants",   TEAL,   ""),
+            (s2, f"{total_dur_f:,.1f}",    "Total Hours Booked",   SKY,    "h"),
+            (s3, f"{avg_part_f:.1f}",      "Avg Participants / Event", AMBER,  ""),
+            (s4, f"{avg_dur_f:.2f}",       "Avg Duration / Event", VIOLET, "h"),
         ]:
             col.markdown(f"""
             <div style="background:#FFFFFF;border-radius:12px;padding:22px 16px 18px;
@@ -1734,9 +1689,6 @@ def main():
             </div>
             """, unsafe_allow_html=True)
 
-        if n_outliers > 0:
-            st.caption(f"* {n_outliers} event(s) with participants > {PARTICIPANT_MAX:,} are excluded from participant stats")
-
         st.markdown('<div class="section-label">Descriptive Statistics</div>', unsafe_allow_html=True)
         col1, col2 = st.columns(2)
         with col1:
@@ -1746,9 +1698,9 @@ def main():
                 use_container_width=True,
             )
         with col2:
-            st.markdown("**Participants (outliers excluded)**")
+            st.markdown("**Participants**")
             st.dataframe(
-                clean_dff.describe().rename('participants_clean').to_frame(),
+                dff['participants'].describe().rename('participants').to_frame(),
                 use_container_width=True,
             )
 
@@ -1760,11 +1712,10 @@ def main():
         st.dataframe(pivot, use_container_width=True)
 
         st.markdown(
-            '<div class="section-label">Participants by Activity Type (outliers excluded)</div>',
+            '<div class="section-label">Participants by Activity Type</div>',
             unsafe_allow_html=True,
         )
-        clean_dff_full = dff[~dff['participant_outlier']]
-        part_by_type   = clean_dff_full.groupby('activity_type')['participants'].agg(
+        part_by_type = dff.groupby('activity_type')['participants'].agg(
             Total='sum', Average='mean', Max='max', Min='min', Count='count'
         ).round(1)
         part_by_type['Total'] = part_by_type['Total'].apply(lambda x: f"{int(x):,}")
@@ -1798,9 +1749,9 @@ def main():
             ),
             (
                 col2, "🗑️", "Removed Rows",
-                "Empty rows · duplicates · negative durations",
+                "Empty rows · duplicates · negative durations · participant outliers",
                 AMBER, "Download removed_rows.xlsx", "dl_removed",
-                lambda: build_removed_excel(empty_rows, duplicate_rows, negative_rows),
+                lambda: build_removed_excel(empty_rows, duplicate_rows, negative_rows, outlier_rows),
                 "removed_rows.xlsx",
                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             ),
@@ -1852,14 +1803,14 @@ def main():
         if ml is None:
             st.warning("Not enough data to make predictions yet. You need at least 50 events with a Held or Cancelled status.")
         else:
-            best_f1   = ml['scores'][ml['best_name']].mean()
+            best_f1 = ml['scores'][ml['best_name']].mean()
 
             mk1, mk2, mk3, mk4 = st.columns(4)
             for col, val, label, color in [
-                (mk1, "✅ Ready",                              "Prediction status",           INDIGO),
-                (mk2, f"{round(best_f1 * 100)}% accurate",    "How often it's correct",      EMERALD),
-                (mk3, f"{ml['n_samples']:,} events",          "Past events it learned from", TEAL),
-                (mk4, f"{ml['cancel_rate']}% cancelled",      "Your overall cancellation rate", ROSE),
+                (mk1, "✅ Ready",                           "Prediction status",           INDIGO),
+                (mk2, f"{round(best_f1 * 100)}% accurate", "How often it's correct",      EMERALD),
+                (mk3, f"{ml['n_samples']:,} events",       "Past events it learned from", TEAL),
+                (mk4, f"{ml['cancel_rate']}% cancelled",   "Your overall cancellation rate", ROSE),
             ]:
                 col.markdown(f"""
                 <div style="background:#FFFFFF;border-radius:10px;padding:18px 12px 14px;
@@ -1943,11 +1894,11 @@ def main():
                 '<div style="font-size:0.82rem;color:#64748B;margin-bottom:16px;line-height:1.6;">'
                 "Fill in the details of an event you're planning. "
                 'The tool will estimate — based on patterns from your past events — '
-                'how likely it is to be cancelled. No technical knowledge needed.</div>',
+                'how likely it is to be cancelled.</div>',
                 unsafe_allow_html=True,
             )
 
-            known_rooms = sorted([r for r in ml['room_enc'].classes_ if r and r != 'Unknown'])
+            known_rooms      = sorted([r for r in ml['room_enc'].classes_ if r and r != 'Unknown'])
             known_activities = sorted([a for a in ml['act_enc'].classes_ if a and a != 'Unknown'])
 
             if "prediction_result" not in st.session_state:
@@ -2040,11 +1991,9 @@ def main():
                     unsafe_allow_html=True,
                 )
 
-    # ── TAB 7: ASK YOUR DATA (Chat) ───────────────────────────────────────────
+    # ── TAB 7: ASK YOUR DATA ──────────────────────────────────────────────────
     with tab7:
         st.markdown('<div style="height:8px"></div>', unsafe_allow_html=True)
-
-       
 
         EXAMPLE_QUESTIONS = [
             "How many events were cancelled last year?",
