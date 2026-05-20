@@ -48,19 +48,15 @@ PARTICIPANT_MAX = 1000
 # ══════════════════════════════════════════════════════════════════════════════
 def remove_outliers(df, column=None):
     if column is None:
-        # Called with a Series directly
         s = df
-    else:
-        s = df[column]
+        return s[(s >= 0) & (s <= PARTICIPANT_MAX)]
     
-    q1 = s.quantile(0.25)
-    q3 = s.quantile(0.75)
+    # DataFrame + column path (used internally in load_and_clean)
+    q1 = df[column].quantile(0.25)
+    q3 = df[column].quantile(0.75)
     iqr = q3 - q1
     lower_bound = q1 - 1.5 * iqr
     upper_bound = q3 + 1.5 * iqr
-
-    if column is None:
-        return s[(s >= lower_bound) & (s <= upper_bound)]
     return df[(df[column] >= lower_bound) & (df[column] <= upper_bound)]
 
 
@@ -566,18 +562,15 @@ def build_excel(df):
     wb.save(buf)
     return buf.getvalue()
 
-
 def build_removed_excel(empty_rows, duplicate_rows, negative_rows, outlier_rows=None):
-    if outlier_rows is None:
-        outlier_rows = pd.DataFrame()
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine='openpyxl') as w:
         empty_rows.to_excel(w, sheet_name='Empty', index=False)
         duplicate_rows.to_excel(w, sheet_name='Duplicates', index=False)
         negative_rows.to_excel(w, sheet_name='Negative_Duration', index=False)
-        outlier_rows.to_excel(w, sheet_name='Participant_Outliers', index=False)
+        if outlier_rows is not None and not outlier_rows.empty:
+            outlier_rows.to_excel(w, sheet_name='Participant_Outliers', index=False)
     return buf.getvalue()
-
 # ══════════════════════════════════════════════════════════════════════════════
 # CHART FUNCTIONS
 # ══════════════════════════════════════════════════════════════════════════════
