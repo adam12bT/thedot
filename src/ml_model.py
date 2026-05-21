@@ -254,7 +254,7 @@ class CancellationPredictor:
             lead_days,
         ]])
         proba = model_result["model"].predict_proba(row)[0][1]
-        return round(proba * 100, 1)
+        return round(proba * 100)
 
     # ── Feature engineering ────────────────────────────────────────────────────
 
