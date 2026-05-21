@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Environment
+.env
+.venv/
+venv/
+
+# IDE
+.vscode/
+
+# OS
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+
+# Data/models
+*.csv
+*.pkl
+*.h5

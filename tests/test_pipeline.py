@@ -9,20 +9,24 @@ import datetime
 import pandas as pd
 import numpy as np
 import pytest
-import sys, os
+import sys
+import os
 
+# ── Path setup ─────────────────────────────────────────────────────────────────
+# Add the project root (one level up from tests/) so all modules are importable.
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from app import (
-    parse_date,
-    map_status,
-    map_space,
-    find_col,
-    remove_outliers,
-    build_excel,
-    build_removed_excel,
-    PARTICIPANT_MAX,
-)
+from src.utils import parse_date, map_status, map_space, find_col
+from src.config import PARTICIPANT_MAX
+from src.exporters import ExcelExporter
+
+
+# Helper that mirrors the old remove_outliers(series) signature used by tests.
+# The new pipeline removes outliers at the DataFrame level inside DataPipeline,
+# so we reproduce the series-level filter logic here for backward-compatible testing.
+def remove_outliers(s: pd.Series) -> pd.Series:
+    """Keep only values in [0, PARTICIPANT_MAX]; drop NaN and out-of-range."""
+    return s[(s >= 0) & (s <= PARTICIPANT_MAX)]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -43,7 +47,6 @@ class TestFindCol:
         assert find_col(df, "STATUS") == "Status"
 
     def test_first_candidate_wins(self):
-        # "title" and "name" both present — first candidate should win
         df = self._df(["name", "title"])
         result = find_col(df, "title", "name")
         assert result == "title"
@@ -91,14 +94,13 @@ class TestParseDateEdgeCases:
 
 class TestMapStatusEdgeCases:
     def test_reporte_passes_through(self):
-        # map_status itself does NOT map Reporté — the pipeline does a
-        # post-hoc .replace(). Verify the function passes it through unchanged
-        # so a future accidental change to map_status is caught here.
+        # map_status itself does NOT map Reporté — DataPipeline._normalise_types
+        # does a post-hoc .replace(). Verify the function passes it through
+        # unchanged so a future accidental change to map_status is caught here.
         result = map_status("Reporté")
         assert result == "Reporté"
 
     def test_strips_whitespace(self):
-        # map_status calls .strip() on input
         assert map_status("  finished  ") == "Tenu"
 
     def test_annule_without_accent(self):
@@ -114,8 +116,7 @@ class TestMapStatusEdgeCases:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestMapSpaceEdgeCases:
-    def test_espace_fondation_with_trailing_space(self):
-        # The mapping dict key has a trailing space: 'ESPACE FONDATION '
+    def test_espace_fondation(self):
         assert map_space("ESPACE FONDATION") == "Salle Fondation"
 
     def test_podcast_tunisia(self):
@@ -125,7 +126,6 @@ class TestMapSpaceEdgeCases:
         assert map_space("Salle Design Thinking") == "Salle Design Thinking"
 
     def test_strips_input(self):
-        # map_space calls .strip() before lookup
         assert map_space("  Terrasse  ") == "Terrasse"
 
     def test_whitespace_only_returns_empty(self):
@@ -166,31 +166,26 @@ class TestRemoveOutliersEdgeCases:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Negative duration swap
+# Mirrors DataPipeline._fix_negative_durations in isolation.
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestNegativeDurationSwap:
-    """
-    Mirrors the logic in load_and_clean that fixes swapped start/end times.
-    Tested in isolation so it can be validated without touching Streamlit cache.
-    """
-
     def _apply_fix(self, df: pd.DataFrame) -> pd.DataFrame:
-            df = df.copy()
-            df["duration_hours"] = (
-                (df["end_time"] - df["start_time"]).dt.total_seconds() / 3600
-            ).round(2)
-            neg_mask = df["duration_hours"] < 0
-            # Use a temp variable to avoid the simultaneous read/write problem
-            tmp = df.loc[neg_mask, "start_time"].copy()
-            df.loc[neg_mask, "start_time"] = df.loc[neg_mask, "end_time"]
-            df.loc[neg_mask, "end_time"] = tmp
-            df.loc[neg_mask, "duration_hours"] = df.loc[neg_mask, "duration_hours"].abs()
-            return df
+        df = df.copy()
+        df["duration_hours"] = (
+            (df["end_time"] - df["start_time"]).dt.total_seconds() / 3600
+        ).round(2)
+        neg_mask = df["duration_hours"] < 0
+        tmp = df.loc[neg_mask, "start_time"].copy()
+        df.loc[neg_mask, "start_time"] = df.loc[neg_mask, "end_time"]
+        df.loc[neg_mask, "end_time"] = tmp
+        df.loc[neg_mask, "duration_hours"] = df.loc[neg_mask, "duration_hours"].abs()
+        return df
 
     def test_swapped_times_are_corrected(self):
         df = pd.DataFrame({
             "start_time": pd.to_datetime(["2024-03-01 16:00"]),
-            "end_time":   pd.to_datetime(["2024-03-01 09:00"]),  # end BEFORE start
+            "end_time":   pd.to_datetime(["2024-03-01 09:00"]),
         })
         fixed = self._apply_fix(df)
         assert fixed.loc[0, "start_time"] < fixed.loc[0, "end_time"]
@@ -215,6 +210,7 @@ class TestNegativeDurationSwap:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Multi-day flag
+# Mirrors DataPipeline._add_derived_columns logic in isolation.
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestMultiDayFlag:
@@ -241,15 +237,10 @@ class TestMultiDayFlag:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # signed_declaration mapping
+# Mirrors the inline logic in DataPipeline._build_records.
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestSignedDeclarationMapping:
-    """
-    Mirrors the inline lambda in load_and_clean:
-      'Oui' if pd.notna(val) and str(val).strip() not in ['', 'nan', 'NaN', '-']
-      else 'Non'
-    """
-
     def _map(self, val):
         policy_val = val
         return (
@@ -282,11 +273,10 @@ class TestSignedDeclarationMapping:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # activity_type mapping from visibility
+# Mirrors the inline logic in DataPipeline._build_records.
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestActivityTypeMapping:
-    """Mirrors the inline logic in load_and_clean."""
-
     def _map(self, visibility):
         vis = visibility
         if vis and str(vis).lower() == "public":
@@ -311,6 +301,7 @@ class TestActivityTypeMapping:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Duplicate detection
+# Mirrors DataPipeline._drop_duplicates logic in isolation.
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestDuplicateDetection:
@@ -318,10 +309,10 @@ class TestDuplicateDetection:
         return pd.DataFrame({
             "event_name": ["Event A", "Event A", "Event B"],
             "start_time": pd.to_datetime([
-                "2024-01-10 09:00", "2024-01-10 09:00", "2024-02-01 10:00"
+                "2024-01-10 09:00", "2024-01-10 09:00", "2024-02-01 10:00",
             ]),
             "end_time": pd.to_datetime([
-                "2024-01-10 11:00", "2024-01-10 11:00", "2024-02-01 12:00"
+                "2024-01-10 11:00", "2024-01-10 11:00", "2024-02-01 12:00",
             ]),
             "room": ["Salle de formation", "Salle de formation", "Terrasse"],
         })
@@ -348,7 +339,9 @@ class TestDuplicateDetection:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# build_excel / build_removed_excel — smoke tests
+# ExcelExporter — smoke tests
+# Previously tested build_excel / build_removed_excel from app.py;
+# now delegated to ExcelExporter.build_cleaned_excel / .build_removed_excel.
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestExcelBuilders:
@@ -368,59 +361,69 @@ class TestExcelBuilders:
             "signed_declaration": ["Oui", "Non"],
             "comment":            ["", "Some comment"],
             "duration_hours":     [2.0, 2.0],
-            "participant_outlier":[False, False],
         })
 
     def test_build_excel_returns_bytes(self):
-        df = self._make_clean_df()
-        result = build_excel(df)
+        result = ExcelExporter.build_cleaned_excel(self._make_clean_df())
         assert isinstance(result, bytes)
         assert len(result) > 0
 
     def test_build_excel_is_valid_xlsx(self):
-        """Verify openpyxl can re-open what build_excel produced."""
         from openpyxl import load_workbook
-        df = self._make_clean_df()
-        result = build_excel(df)
+        result = ExcelExporter.build_cleaned_excel(self._make_clean_df())
         wb = load_workbook(io.BytesIO(result))
-        assert "EVENTS" in wb.sheetnames
-        assert "SUMMARY" in wb.sheetnames
+        assert "EVENTS"   in wb.sheetnames
+        assert "SUMMARY"  in wb.sheetnames
 
     def test_build_excel_row_count(self):
         from openpyxl import load_workbook
-        df = self._make_clean_df()
-        result = build_excel(df)
+        result = ExcelExporter.build_cleaned_excel(self._make_clean_df())
         wb = load_workbook(io.BytesIO(result))
         ws = wb["EVENTS"]
         # 1 header + 2 data rows
         assert ws.max_row == 3
 
     def test_build_removed_excel_returns_bytes(self):
-        empty_rows    = pd.DataFrame()
-        duplicate_rows = pd.DataFrame()
-        negative_rows  = pd.DataFrame()
-        result = build_removed_excel(empty_rows, duplicate_rows, negative_rows)
+        result = ExcelExporter.build_removed_excel(
+            pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+        )
         assert isinstance(result, bytes)
         assert len(result) > 0
 
     def test_build_removed_excel_has_three_sheets(self):
         from openpyxl import load_workbook
-        empty_rows     = pd.DataFrame({"a": [1]})
-        duplicate_rows = pd.DataFrame({"a": [2]})
-        negative_rows  = pd.DataFrame({"a": [3]})
-        result = build_removed_excel(empty_rows, duplicate_rows, negative_rows)
+        result = ExcelExporter.build_removed_excel(
+            pd.DataFrame({"a": [1]}),
+            pd.DataFrame({"a": [2]}),
+            pd.DataFrame({"a": [3]}),
+        )
         wb = load_workbook(io.BytesIO(result))
         assert set(wb.sheetnames) == {"Empty", "Duplicates", "Negative_Duration"}
+
+    def test_build_removed_excel_with_outliers_has_four_sheets(self):
+        """Verify the optional outlier_rows sheet is included when non-empty."""
+        from openpyxl import load_workbook
+        result = ExcelExporter.build_removed_excel(
+            pd.DataFrame({"a": [1]}),
+            pd.DataFrame({"a": [2]}),
+            pd.DataFrame({"a": [3]}),
+            outlier_rows=pd.DataFrame({"a": [4]}),
+        )
+        wb = load_workbook(io.BytesIO(result))
+        assert "Participant_Outliers" in wb.sheetnames
+
+    def test_build_filtered_csv_returns_bytes(self):
+        result = ExcelExporter.build_filtered_csv(self._make_clean_df())
+        assert isinstance(result, bytes)
+        assert b"event_name" in result
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Gemini API key validation
+# Uses AIQueryEngine internals / config to validate the key.
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestGeminiApiKey:
-    """
-    Verifies that the API key is present, non-empty, and reachable by Gemini.
-    Prints the exact error message if anything goes wrong.
-    """
-
     def test_api_key_is_set(self):
         import os
         from dotenv import load_dotenv
@@ -444,6 +447,20 @@ class TestGeminiApiKey:
             "https://aistudio.google.com/app/apikey"
         )
 
+    def test_api_key_matches_config(self):
+        """config.GEMINI_API_KEY should match the environment variable."""
+        import os
+        from dotenv import load_dotenv
+        load_dotenv()
+        from src.config import GEMINI_API_KEY
+        env_key = os.getenv("GEMINI_API_KEY", "")
+        if not env_key:
+            pytest.skip("GEMINI_API_KEY not set — skipping")
+        assert GEMINI_API_KEY == env_key, (
+            "config.GEMINI_API_KEY does not match the GEMINI_API_KEY env var. "
+            "Check _get_gemini_key() in config.py."
+        )
+
     def test_api_key_works_with_gemini(self):
         """Makes a real (minimal) call to Gemini and prints the exact error if it fails."""
         import os
@@ -456,9 +473,9 @@ class TestGeminiApiKey:
         try:
             import google.generativeai as genai
             genai.configure(api_key=key)
-            model = genai.GenerativeModel("gemini-2.5-flash")
+            model    = genai.GenerativeModel("gemini-2.5-flash")
             response = model.generate_content("Reply with the single word: OK")
-            text = response.text.strip()
+            text     = response.text.strip()
             assert text, (
                 "PROBLEM: Gemini returned an empty response.\n"
                 "This may mean the model name is wrong or the key has no quota."
