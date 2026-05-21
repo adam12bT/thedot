@@ -40,8 +40,8 @@ EXAMPLE_QUESTIONS = [
 ML_FEATURE_LABELS = [
     "Time of day", "Month of year", "Day of week", "Event duration",
     "Room used", "Type of activity", "Number of guests",
+    "Is weekend", "Is morning", "Is large event", "Days booked in advance",
 ]
-
 
 class EventAnalyticsApp:
     """Main application class.  Call `.run()` to launch the Streamlit UI."""
@@ -511,6 +511,7 @@ class EventAnalyticsApp:
             (f"{round(pr_auc * 100)}% PR-AUC", "Precision-recall score",     EMERALD),
             (f"{ml['n_samples']:,} events",    "Past events it learned from",TEAL),
             (f"{ml['cancel_rate']}% cancelled","Your overall cancel rate",    ROSE),
+            (f"+{ml['model_gain']}% vs baseline", "Improvement over random", VIOLET),
         ]):
             col.markdown(f"""
             <div style="background:#FFFFFF;border-radius:10px;padding:18px 12px 14px;
@@ -527,7 +528,7 @@ class EventAnalyticsApp:
         with ca1:
             st.markdown('<div class="chart-card">', unsafe_allow_html=True)
             st.pyplot(ChartBuilder.ml_cv_scores(ml["scores"]), use_container_width=True)
-            st.markdown('<div style="font-size:0.75rem;color:#94A3B8;margin-top:8px;">Three different methods were tested — the highest bar was chosen.</div>', unsafe_allow_html=True)
+            st.markdown('<div style="font-size:0.75rem;color:#94A3B8;margin-top:8px;">Four different methods were tested — the highest bar was chosen.</div>', unsafe_allow_html=True)
             st.markdown("</div>", unsafe_allow_html=True)
         with ca2:
             st.markdown('<div class="chart-card">', unsafe_allow_html=True)
@@ -562,21 +563,32 @@ class EventAnalyticsApp:
 
         with st.form("prediction_form"):
             p1, p2, p3 = st.columns(3)
-            p4, p5, p6, p7 = st.columns(4)
+            p4, p5, p6, p7, p8 = st.columns(5)
             with p1: pred_room     = st.selectbox("Room", known_rooms)
             with p2: pred_activity = st.selectbox("Activity type", known_activities)
             with p3: pred_weekday  = st.selectbox("Day of week",
                 ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"])
-            with p4: pred_hour = st.slider("Start hour", 0, 23, 9, format="%d:00")
-            with p5: pred_month = st.slider("Month", 1, 12, 6)
-            with p6: pred_duration = st.slider("Duration (hours)", 0.5, 24.0, 2.0, step=0.5, format="%.1f h")
-            with p7: pred_participants = st.slider("Expected guests", 0, PARTICIPANT_MAX, 50)
+            with p4:
+                st.markdown('<div style="font-size:0.75rem;font-weight:600;color:#64748B;margin-bottom:4px;">Start hour</div>', unsafe_allow_html=True)
+                pred_hour = st.slider("Start hour", 0, 23, 9, format="%d:00", label_visibility="collapsed")
+            with p5:
+                st.markdown('<div style="font-size:0.75rem;font-weight:600;color:#64748B;margin-bottom:4px;">Month</div>', unsafe_allow_html=True)
+                pred_month = st.slider("Month", 1, 12, 6, label_visibility="collapsed")
+            with p6:
+                st.markdown('<div style="font-size:0.75rem;font-weight:600;color:#64748B;margin-bottom:4px;">Duration (hours)</div>', unsafe_allow_html=True)
+                pred_duration = st.slider("Duration (hours)", 0.5, 24.0, 2.0, step=0.5, format="%.1f h", label_visibility="collapsed")
+            with p7:
+                st.markdown('<div style="font-size:0.75rem;font-weight:600;color:#64748B;margin-bottom:4px;">Expected guests</div>', unsafe_allow_html=True)
+                pred_participants = st.slider("Expected guests", 0, PARTICIPANT_MAX, 50, label_visibility="collapsed")
+            with p8:
+                st.markdown('<div style="font-size:0.75rem;font-weight:600;color:#64748B;margin-bottom:4px;">Days booked in advance</div>', unsafe_allow_html=True)
+                pred_lead_days = st.slider("Days booked in advance", 0, 365, 7, label_visibility="collapsed")
             submitted = st.form_submit_button("🔮 Predict cancellation risk", use_container_width=True)
 
         if submitted:
             risk = CancellationPredictor.predict(
                 ml, pred_hour, pred_month, pred_weekday,
-                pred_duration, pred_room, pred_activity, pred_participants,
+                pred_duration, pred_room, pred_activity, pred_participants,booking_lead_days=pred_lead_days,
             )
             st.session_state.prediction_result = risk
 

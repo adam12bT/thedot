@@ -29,26 +29,12 @@ class AIQueryEngine:
 
     @staticmethod
     def query(question: str, df: pd.DataFrame, history: list) -> dict:
-        """
-        Send *question* to Gemini, receive Python/pandas code, execute it
-        against *df*, and return a result dict.
-
-        Parameters
-        ----------
-        question : str
-        df       : pd.DataFrame  — the current (filtered) data frame
-        history  : list of {"role": "user"|"assistant", "content": str}
-
-        Returns
-        -------
-        dict with keys: answer, thought, code, result_df, error
-        """
         if not GEMINI_API_KEY:
             return AIQueryEngine._error_result(
                 "No Gemini API key set. Add GEMINI_API_KEY to your environment variables."
             )
 
-        system_prompt = AIQueryEngine._build_system_prompt(df)
+        system_prompt  = AIQueryEngine._build_system_prompt(df)
         gemini_history = [
             {"role": "model" if m["role"] == "assistant" else "user", "parts": [m["content"]]}
             for m in history
@@ -69,15 +55,18 @@ class AIQueryEngine:
             if parsed is None:
                 return AIQueryEngine._error_result("Model did not return valid JSON.", code=raw)
 
-            code      = parsed.get("code", "").strip()
-            code      = code.replace("\\n", "\n").replace("\\'", "'")
+            code = parsed.get("code", "").strip()
+            code = code.replace("\\n", "\n").replace("\\'", "'")
+
             result_df = AIQueryEngine._execute_code(code, df)
 
-            answer_text = parsed.get("answer", "")
-            auto        = AIQueryEngine._auto_answer(result_df)
+            # Always derive the answer from the actual result_df — never trust
+            # the model's pre-computed answer string for numeric/named results.
+            auto = AIQueryEngine._auto_answer(result_df)
             if auto:
                 answer_text = auto
             else:
+                answer_text = parsed.get("answer", "")
                 answer_text = AIQueryEngine._fix_answer_number(answer_text, result_df)
 
             return {
@@ -107,10 +96,12 @@ Rules:
 1. Write pandas code that answers the question using the variable `df`.
 2. Store the final result in a variable called `result_df` (always a DataFrame or None).
 3. If the result is a single number or value, wrap it: result_df = pd.DataFrame([{{"result": <value>}}])
-4. Return ONLY a valid JSON object — no markdown fences, no extra text — with these exact keys:
+4. For ranking/top-N questions, sort descending and keep all relevant rows in result_df.
+5. ALWAYS store the complete answer data in result_df — do not summarise in code, let result_df hold the full answer.
+6. Return ONLY a valid JSON object — no markdown fences, no extra text — with these exact keys:
    - "thought" : your brief reasoning (1-2 sentences)
-   - "code"    : the executable Python/pandas code. IMPORTANT: use only single quotes for Python strings inside the code field to avoid JSON parse errors. Never use double quotes inside Python string literals in the code.
-   - "answer"  : plain-English answer. CRITICAL: if your code computes a scalar result stored in result_df, you MUST read that computed value and use it in your answer. Never guess or assume the number — always derive the answer from what your code actually computes.
+   - "code"    : the executable Python/pandas code. Use only single quotes for Python strings inside the code field. Never use double quotes inside Python string literals.
+   - "answer"  : plain-English answer. CRITICAL: you MUST read the actual computed values from result_df to write this answer. Read result_df.iloc[0] for the top result. Never guess, hallucinate, or hardcode numbers — always derive from what your code computes.
 
 CRITICAL JSON RULES:
 - The entire response must be valid JSON.
@@ -119,7 +110,7 @@ CRITICAL JSON RULES:
 - Use single quotes for all Python string literals in the code field.
 
 Example output format:
-{{"thought":"I will filter for cancelled events in the last year and count them.","code":"last_year = df['year'].max() - 1\\nfiltered = df[(df['year'] == last_year) & (df['status'] == 'Annulé')]\\nresult_df = pd.DataFrame([{{'result': len(filtered)}}])","answer":"There were 42 events cancelled last year."}}"""
+{{"thought":"I will group by month and compute cancellation rate, then find the max.","code":"grouped = df.groupby('month_name').apply(lambda x: (x['status'] == 'Annulé').mean() * 100).reset_index()\\ngrouped.columns = ['month_name', 'cancellation_rate']\\nresult_df = grouped.sort_values('cancellation_rate', ascending=False)","answer":"The month with the highest cancellation rate is July, with a rate of 16.49%."}}"""
 
     @staticmethod
     def _parse_response(raw: str) -> dict | None:
@@ -182,9 +173,14 @@ Example output format:
 
     @staticmethod
     def _auto_answer(result_df) -> str | None:
-        """Generate a short, confident answer for single-cell results."""
+        """
+        Generate a confident answer directly from result_df so the model's
+        pre-written answer string is never trusted for numeric/named values.
+        """
         if result_df is None or result_df.empty:
             return None
+
+        # Single scalar result — e.g. result_df = pd.DataFrame([{"result": 42}])
         if result_df.shape == (1, 1) and result_df.columns[0] == "result":
             val = result_df.iloc[0, 0]
             if isinstance(val, (int, np.integer)):
@@ -192,11 +188,30 @@ Example output format:
             if isinstance(val, (float, np.floating)):
                 return f"The answer is **{float(val):,.2f}**."
             return f"The answer is **{val}**."
+
+        # Multi-column result — read first row for the top answer
+        if result_df.shape[0] >= 1:
+            row   = result_df.iloc[0]
+            parts = []
+            for col, val in row.items():
+                if isinstance(val, (int, np.integer)):
+                    parts.append(f"**{col}**: {int(val):,}")
+                elif isinstance(val, (float, np.floating)):
+                    parts.append(f"**{col}**: {float(val):,.2f}")
+                else:
+                    parts.append(f"**{col}**: {val}")
+            suffix = f" ({len(result_df):,} rows total)" if len(result_df) > 1 else ""
+            return "Top result — " + " · ".join(parts) + suffix + "."
+
         return None
 
     @staticmethod
     def _fix_answer_number(answer: str, result_df) -> str:
-        """Replace any mismatched scalar in *answer* with the actual computed value."""
+        """
+        Last-resort fix: replace any mismatched scalar in the model's answer
+        string with the actual computed value from result_df.
+        Only runs when _auto_answer returns None (e.g. empty result).
+        """
         if result_df is None or result_df.empty:
             return answer
         try:
