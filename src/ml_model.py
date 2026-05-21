@@ -1,18 +1,3 @@
-"""
-ml_model.py
------------
-CancellationPredictor
-    Trains a cancellation-risk model on historical event data and exposes a
-    single-event prediction method.
-
-Public API
-----------
-    CancellationPredictor.train(file_bytes, file_name)   → dict | None
-        Cached via @st.cache_data.  Returns a result dict or None when there
-        is insufficient data.
-
-    CancellationPredictor.predict(model_result, ...)     → float (0–100 %)
-"""
 
 import numpy as np
 import pandas as pd

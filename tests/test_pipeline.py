@@ -1,8 +1,3 @@
-"""
-tests/test_pipeline_extended.py
-Additional tests covering logic not exercised by test_pipeline.py.
-Run: pytest tests/ -v
-"""
 
 import io
 import datetime

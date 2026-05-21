@@ -1,14 +1,3 @@
-"""
-utils.py
---------
-Pure helper functions shared across modules:
-  - parse_date      : flexible datetime parser
-  - find_col        : case-insensitive column lookup
-  - map_status      : normalise status strings → 'Tenu' / 'Annulé'
-  - map_space       : normalise room/space names
-  - chart_style     : global matplotlib rcParams
-  - make_fig        : factory for a styled (fig, ax) pair
-"""
 
 import re
 import datetime

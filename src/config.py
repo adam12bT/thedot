@@ -1,8 +1,3 @@
-"""
-config.py
----------
-Global constants, colour palette, chart style defaults, and CSS.
-"""
 
 import os
 import streamlit as st

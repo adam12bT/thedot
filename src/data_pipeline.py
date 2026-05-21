@@ -1,23 +1,11 @@
-"""
-data_pipeline.py
-----------------
-DataPipeline
-    Responsible for reading a CSV/XLSX upload, normalising every column,
-    flagging / removing dirty rows, and returning a clean DataFrame together
-    with the removed-row audit frames.
-
-Public API
-----------
-    DataPipeline.load_and_clean(file_bytes, file_name)
-        → (df, empty_rows, duplicate_rows, negative_rows, outlier_rows)
-"""
-
 import io
+import re
 import datetime
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+from rapidfuzz import fuzz
 
 from src.config import PARTICIPANT_MAX
 from src.utils import parse_date, find_col, map_status, map_space
@@ -42,7 +30,9 @@ class DataPipeline:
         df = pd.DataFrame(records)
 
         df, empty_rows     = DataPipeline._drop_empty(df)
-        df, duplicate_rows = DataPipeline._drop_duplicates(df)
+        df                 = DataPipeline._clean_event_names(df)       # fix whitespace, pipes, caps
+        df                 = DataPipeline._normalize_similar_names(df) # fix near-typos (fuzzy)
+        df, duplicate_rows = DataPipeline._drop_duplicates(df)         # 3-tier dedup
         df                 = DataPipeline._normalise_types(df)
         df, negative_rows  = DataPipeline._fix_negative_durations(df)
         df                 = DataPipeline._add_derived_columns(df)
@@ -134,10 +124,109 @@ class DataPipeline:
         return df[~empty_mask].reset_index(drop=True), df[empty_mask].copy()
 
     @staticmethod
+    def _clean_event_names(df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Fix 4 known dirty-name patterns:
+          1. Extra / collapsed whitespace  →  single space, stripped
+          2. Pipe-duplicated segments      →  "X | X | Y"  →  "X | Y"
+          3. Inconsistent pipe spacing     →  "X| Y"       →  "X | Y"
+          4. Accidental ALL-CAPS names     →  title-cased
+        """
+        def _fix(name):
+            if pd.isna(name):
+                return name
+
+            s = str(name)
+
+            # 1. Collapse whitespace
+            s = re.sub(r'\s+', ' ', s).strip()
+
+            # 2 & 3. Deduplicate + normalise pipe-separated segments
+            if "|" in s:
+                parts = [p.strip() for p in s.split("|")]
+                seen = []
+                for p in parts:
+                    if p.lower() not in [x.lower() for x in seen]:
+                        seen.append(p)
+                s = " | ".join(seen)
+
+            # 4. All-caps → title case (preserve intentional acronyms inside mixed names)
+            if s == s.upper() and len(s) > 5:
+                s = s.title()
+
+            return s
+
+        df["event_name"] = df["event_name"].apply(_fix)
+        return df
+
+    @staticmethod
+    def _normalize_similar_names(df: pd.DataFrame) -> pd.DataFrame:
+        """
+        If two event names are ≥95% similar (fuzzy match), normalize the rarer
+        one to match the more common one. This catches near-typos like:
+          "Pitching and evaluation intermédiairedes candidats"
+          "Pitching and evaluation intermédiaire des candidats"
+        Only applies to names that share the same organizer email AND same room,
+        to avoid false positives on short or generic names.
+        """
+        name_counts = df["event_name"].value_counts()
+        names = name_counts.index.tolist()  # sorted most → least frequent
+
+        corrections = {}
+        for i, a in enumerate(names):
+            if a in corrections:
+                continue
+            for b in names[i + 1:]:
+                if b in corrections:
+                    continue
+                # Only compare names of similar length to avoid false positives
+                if abs(len(a) - len(b)) > 10:
+                    continue
+                if fuzz.ratio(a.lower(), b.lower()) >= 95:
+                    # Keep the more frequent name (a is already more frequent)
+                    corrections[b] = a
+
+        if corrections:
+            df["event_name"] = df["event_name"].replace(corrections)
+        return df
+
+    @staticmethod
     def _drop_duplicates(df: pd.DataFrame):
-        dupe_cols = [c for c in ["event_name", "start_time", "end_time", "room"] if c in df.columns]
-        dupe_mask = df.duplicated(subset=dupe_cols, keep="first")
-        return df[~dupe_mask].reset_index(drop=True), df[dupe_mask].copy()
+        df["_name_key"] = df["event_name"].str.strip().str.lower()
+        df["_date_key"] = df["start_time"].dt.date  # ← new
+
+        all_dupe_indices = set()
+
+        # ── Tier 1: exact duplicates ──────────────────────────────────────────
+        exact_cols = ["_name_key", "start_time", "end_time", "room", "participants"]
+        exact_mask = df.duplicated(subset=exact_cols, keep="first")
+        all_dupe_indices.update(df[exact_mask].index.tolist())
+
+        # ── Tier 2: same event same DAY, one Tenu / one Annulé → keep Tenu ───
+        status_key = ["_name_key", "_date_key"]  # ← was ["_name_key","room","participants"]
+        status_order = {"Tenu": 0, "Annulé": 1}
+        df["_status_rank"] = df["status"].map(status_order).fillna(2)
+        df_sorted = df.sort_values("_status_rank")
+        status_mask = df_sorted.duplicated(subset=status_key, keep="first")
+        all_dupe_indices.update(df_sorted[status_mask].index.tolist())
+
+        # ── Tier 3: multi-room same event ────────────────────────────────────
+        multi_key = ["_name_key", "start_time", "end_time"]
+        for _, group in df.groupby(multi_key):
+            if group["room"].nunique() > 1 and group["participants"].nunique() == 1:
+                rooms_combined = " | ".join(group["room"].dropna().unique())
+                kept_idx = group.index[0]
+                df.at[kept_idx, "room"] = rooms_combined
+                all_dupe_indices.update(group.index[1:].tolist())
+
+        dupe_mask = df.index.isin(all_dupe_indices)
+        duplicate_rows = df[dupe_mask].copy()
+        df = (
+            df[~dupe_mask]
+            .drop(columns=["_name_key", "_status_rank", "_date_key"])  # ← drop _date_key too
+            .reset_index(drop=True)
+        )
+        return df, duplicate_rows
 
     @staticmethod
     def _normalise_types(df: pd.DataFrame) -> pd.DataFrame:

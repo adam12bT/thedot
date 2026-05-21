@@ -1,16 +1,4 @@
-"""
-charts.py
----------
-ChartBuilder
-    Each public method receives a filtered DataFrame and returns a matplotlib
-    Figure (or None when there is not enough data).
 
-    All rendering details (colours, axes styles) are isolated here so the
-    application layer only needs to call e.g.::
-
-        fig = ChartBuilder.status(dff)
-        st.pyplot(fig)
-"""
 
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker

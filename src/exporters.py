@@ -1,15 +1,4 @@
-"""
-exporters.py
-------------
-ExcelExporter
-    Builds styled, download-ready Excel workbooks and CSV byte-strings.
 
-Public API
-----------
-    ExcelExporter.build_cleaned_excel(df)        → bytes
-    ExcelExporter.build_removed_excel(...)        → bytes
-    ExcelExporter.build_filtered_csv(df)          → bytes
-"""
 
 import io
 import datetime

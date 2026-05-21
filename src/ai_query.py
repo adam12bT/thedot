@@ -1,17 +1,3 @@
-"""
-ai_query.py
------------
-AIQueryEngine
-    Translates a plain-English question into a pandas code snippet via the
-    Gemini API, executes that code against the current DataFrame, and returns
-    a structured result dict.
-
-Public API
-----------
-    AIQueryEngine.query(question, df, history)  → dict
-        Keys: answer, thought, code, result_df, error
-"""
-
 import json
 import re
 
