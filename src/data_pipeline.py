@@ -285,4 +285,13 @@ class DataPipeline:
         outlier_mask = ~df["participants"].isna() & (
             (df["participants"] < 0) | (df["participants"] > PARTICIPANT_MAX)
         )
-        return df[~outlier_mask].reset_index(drop=True), df[outlier_mask].copy()
+        outlier_rows = df[outlier_mask].copy()
+
+        # Compute mean from valid (non-outlier) rows only, then round to nearest int
+        valid_mask = ~df["participants"].isna() & ~outlier_mask
+        mean_participants = round(df.loc[valid_mask, "participants"].mean())
+
+        # Replace outliers with the mean instead of dropping them
+        df.loc[outlier_mask, "participants"] = mean_participants
+
+        return df.reset_index(drop=True), outlier_rows

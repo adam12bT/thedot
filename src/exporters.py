@@ -13,7 +13,6 @@ from openpyxl.worksheet.table import Table, TableStyleInfo
 class ExcelExporter:
     """Static methods for building Excel / CSV download artefacts."""
 
-    # ── Cleaned events workbook ────────────────────────────────────────────────
 
     @staticmethod
     def build_cleaned_excel(df: pd.DataFrame) -> bytes:
@@ -22,7 +21,6 @@ class ExcelExporter:
         ws = wb.active
         ws.title = "EVENTS"
 
-        # Style objects
         hf  = Font(name="Calibri", bold=True, color="FFFFFF", size=10)
         hfi = PatternFill("solid", fgColor="4F46E5")
         ha  = Alignment(horizontal="center", vertical="center", wrap_text=True)
